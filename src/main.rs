@@ -7,7 +7,7 @@ mod state;
 mod task_db;
 
 use anyhow::{Context, Result};
-use axum::{routing::get, Json, Router};
+use axum::{Json, Router, routing::get};
 use evo_common::logging::init_logging;
 use serde_json::json;
 use socketioxide::SocketIo;
@@ -29,11 +29,10 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let db_path = std::env::var("KING_DB_PATH")
-        .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
+    let db_path = std::env::var("KING_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
 
-    let gateway_config_path = std::env::var("GATEWAY_CONFIG_PATH")
-        .unwrap_or_else(|_| DEFAULT_GATEWAY_CONFIG.to_string());
+    let gateway_config_path =
+        std::env::var("GATEWAY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_GATEWAY_CONFIG.to_string());
 
     // ── Database ──────────────────────────────────────────────────────────────
     info!(db = %db_path, "initializing database");
@@ -85,9 +84,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind to {addr}"))?;
 
-    axum::serve(listener, app)
-        .await
-        .context("Server error")?;
+    axum::serve(listener, app).await.context("Server error")?;
 
     Ok(())
 }

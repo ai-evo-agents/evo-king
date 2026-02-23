@@ -164,7 +164,14 @@ pub async fn create_task(
     conn.execute(
         "INSERT INTO tasks (id, task_type, status, agent_id, payload, created_at, updated_at)
          VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6)",
-        libsql::params![id.as_str(), task_type, agent, payload, now.as_str(), now.as_str()],
+        libsql::params![
+            id.as_str(),
+            task_type,
+            agent,
+            payload,
+            now.as_str(),
+            now.as_str()
+        ],
     )
     .await
     .context("create task")?;
@@ -274,7 +281,10 @@ pub async fn update_task(
         id_param,
     );
 
-    let rows_affected = conn.execute(&sql, param_values).await.context("update task")?;
+    let rows_affected = conn
+        .execute(&sql, param_values)
+        .await
+        .context("update task")?;
 
     if rows_affected == 0 {
         return Ok(None);
@@ -288,10 +298,7 @@ pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
     let conn = db.connect().context("DB connect")?;
 
     let rows_affected = conn
-        .execute(
-            "DELETE FROM tasks WHERE id = ?1",
-            libsql::params![task_id],
-        )
+        .execute("DELETE FROM tasks WHERE id = ?1", libsql::params![task_id])
         .await
         .context("delete task")?;
 

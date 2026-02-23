@@ -15,8 +15,7 @@ pub async fn watch_config(path: &str, state: Arc<KingState>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
 
     // Canonicalize so path comparisons are exact
-    let path_buf = std::fs::canonicalize(path)
-        .unwrap_or_else(|_| PathBuf::from(path));
+    let path_buf = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
     let watch_dir = path_buf
         .parent()
@@ -33,18 +32,11 @@ pub async fn watch_config(path: &str, state: Arc<KingState>) -> Result<()> {
 
     while let Some(event_result) = rx.recv().await {
         match event_result {
-            Ok(ev)
-                if matches!(
-                    ev.kind,
-                    EventKind::Modify(_) | EventKind::Create(_)
-                ) =>
-            {
+            Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
                 // Only react if it's our specific file
                 if ev.paths.iter().any(|p| p == &path_buf) {
                     info!("gateway config file changed, running lifecycle");
-                    if let Err(e) =
-                        gateway_manager::on_config_change(path, &state).await
-                    {
+                    if let Err(e) = gateway_manager::on_config_change(path, &state).await {
                         error!(err = %e, "config lifecycle failed");
                     }
                 }

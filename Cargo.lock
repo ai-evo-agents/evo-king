@@ -520,7 +520,7 @@ dependencies = [
 [[package]]
 name = "evo-common"
 version = "0.1.0"
-source = "git+https://github.com/ai-evo-agents/evo-common.git#d246062a7bebcbd6c2e2c5e3642278f30e1e8d76"
+source = "git+https://github.com/ai-evo-agents/evo-common.git#6e981564899178e4e45407dee8c0c7bcf749c3f4"
 dependencies = [
  "chrono",
  "serde",

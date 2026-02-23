@@ -1,7 +1,7 @@
 use crate::{state::KingState, task_db};
-use evo_common::messages::{events, AgentRole};
-use socketioxide::extract::{AckSender, Data, SocketRef};
+use evo_common::messages::{AgentRole, events};
 use socketioxide::SocketIo;
+use socketioxide::extract::{AckSender, Data, SocketRef};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -19,15 +19,15 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
 
         // Clone arcs for each handler so every closure is independent
         let s_register = Arc::clone(&state);
-        let s_status   = Arc::clone(&state);
-        let s_report   = Arc::clone(&state);
-        let s_health   = Arc::clone(&state);
+        let s_status = Arc::clone(&state);
+        let s_report = Arc::clone(&state);
+        let s_health = Arc::clone(&state);
 
         // Task management handler arcs
         let s_task_create = Arc::clone(&state);
         let s_task_update = Arc::clone(&state);
-        let s_task_get    = Arc::clone(&state);
-        let s_task_list   = Arc::clone(&state);
+        let s_task_get = Arc::clone(&state);
+        let s_task_list = Arc::clone(&state);
         let s_task_delete = Arc::clone(&state);
 
         // agent:register — runner announces itself + its role
@@ -113,9 +113,11 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             },
         );
 
-        socket.on_disconnect(|s: SocketRef, _reason: socketioxide::socket::DisconnectReason| {
-            info!(sid = %s.id, "runner disconnected");
-        });
+        socket.on_disconnect(
+            |s: SocketRef, _reason: socketioxide::socket::DisconnectReason| {
+                info!(sid = %s.id, "runner disconnected");
+            },
+        );
     });
 }
 
@@ -173,13 +175,8 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
 
     info!(agent_id = %agent_id, skill_id = %skill_id, "skill report received");
 
-    if let Err(e) = task_db::create_task(
-        &state.db,
-        "skill_report",
-        Some(agent_id),
-        &data.to_string(),
-    )
-    .await
+    if let Err(e) =
+        task_db::create_task(&state.db, "skill_report", Some(agent_id), &data.to_string()).await
     {
         warn!(err = %e, "failed to persist skill report task");
     }
@@ -256,7 +253,10 @@ async fn on_task_create(
             }
 
             let broadcast = serde_json::json!({ "action": "created", "task": response });
-            if let Err(e) = socket.to(events::ROOM_KERNEL).emit(events::TASK_CHANGED, &broadcast) {
+            if let Err(e) = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::TASK_CHANGED, &broadcast)
+            {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
         }
@@ -295,7 +295,10 @@ async fn on_task_update(
             }
 
             let broadcast = serde_json::json!({ "action": "updated", "task": response });
-            if let Err(e) = socket.to(events::ROOM_KERNEL).emit(events::TASK_CHANGED, &broadcast) {
+            if let Err(e) = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::TASK_CHANGED, &broadcast)
+            {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
         }
@@ -375,7 +378,10 @@ async fn on_task_delete(
             let _ = ack.send(&serde_json::json!({ "success": true, "task_id": task_id }));
 
             let broadcast = serde_json::json!({ "action": "deleted", "task_id": task_id });
-            if let Err(e) = socket.to(events::ROOM_KERNEL).emit(events::TASK_CHANGED, &broadcast) {
+            if let Err(e) = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::TASK_CHANGED, &broadcast)
+            {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
         }

@@ -82,9 +82,7 @@ pub async fn on_config_change(config_path: &str, state: &KingState) -> Result<()
 async fn backup_config(config_path: &str, content: &str) -> Result<String> {
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
 
-    let parent = Path::new(config_path)
-        .parent()
-        .unwrap_or(Path::new("."));
+    let parent = Path::new(config_path).parent().unwrap_or(Path::new("."));
 
     let backup_dir = parent.join("backups");
     tokio::fs::create_dir_all(&backup_dir)
