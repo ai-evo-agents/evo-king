@@ -125,31 +125,175 @@ pub async fn log_config_event(
 
 // ─── Tasks ────────────────────────────────────────────────────────────────────
 
-/// Create a new task and return its ID.
+/// Internal task row from database queries.
+#[derive(Debug, Clone)]
+pub struct TaskRow {
+    pub id: String,
+    pub task_type: String,
+    pub status: String,
+    pub agent_id: String,
+    pub payload: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
+    Ok(TaskRow {
+        id: row.get::<String>(0).context("read id")?,
+        task_type: row.get::<String>(1).context("read task_type")?,
+        status: row.get::<String>(2).context("read status")?,
+        agent_id: row.get::<String>(3).context("read agent_id")?,
+        payload: row.get::<String>(4).context("read payload")?,
+        created_at: row.get::<String>(5).context("read created_at")?,
+        updated_at: row.get::<String>(6).context("read updated_at")?,
+    })
+}
+
+/// Create a new task and return the full row.
 pub async fn create_task(
     db: &Database,
     task_type: &str,
     agent_id: Option<&str>,
     payload: &str,
-) -> Result<String> {
+) -> Result<TaskRow> {
     let conn = db.connect().context("DB connect")?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
+    let agent = agent_id.unwrap_or("");
 
     conn.execute(
         "INSERT INTO tasks (id, task_type, status, agent_id, payload, created_at, updated_at)
          VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6)",
-        libsql::params![
-            id.as_str(),
-            task_type,
-            agent_id.unwrap_or(""),
-            payload,
-            now.as_str(),
-            now.as_str()
-        ],
+        libsql::params![id.as_str(), task_type, agent, payload, now.as_str(), now.as_str()],
     )
     .await
     .context("create task")?;
 
-    Ok(id)
+    Ok(TaskRow {
+        id,
+        task_type: task_type.to_string(),
+        status: "pending".to_string(),
+        agent_id: agent.to_string(),
+        payload: payload.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+/// Fetch a single task by ID.
+pub async fn get_task(db: &Database, task_id: &str) -> Result<Option<TaskRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, task_type, status, agent_id, payload, created_at, updated_at
+             FROM tasks WHERE id = ?1",
+            libsql::params![task_id],
+        )
+        .await
+        .context("query task by id")?;
+
+    match rows.next().await.context("read row")? {
+        Some(row) => Ok(Some(row_to_task(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// List tasks with optional status and agent filters, ordered by newest first.
+pub async fn list_tasks(
+    db: &Database,
+    limit: u32,
+    status_filter: Option<&str>,
+    agent_filter: Option<&str>,
+) -> Result<Vec<TaskRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut sql = String::from(
+        "SELECT id, task_type, status, agent_id, payload, created_at, updated_at FROM tasks WHERE 1=1",
+    );
+    let mut param_values: Vec<libsql::Value> = Vec::new();
+
+    if let Some(status) = status_filter {
+        param_values.push(libsql::Value::Text(status.to_string()));
+        sql.push_str(&format!(" AND status = ?{}", param_values.len()));
+    }
+    if let Some(agent) = agent_filter {
+        param_values.push(libsql::Value::Text(agent.to_string()));
+        sql.push_str(&format!(" AND agent_id = ?{}", param_values.len()));
+    }
+
+    param_values.push(libsql::Value::Integer(i64::from(limit)));
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ?{}",
+        param_values.len()
+    ));
+
+    let mut rows = conn.query(&sql, param_values).await.context("list tasks")?;
+    let mut tasks = Vec::new();
+
+    while let Some(row) = rows.next().await.context("read row")? {
+        tasks.push(row_to_task(&row)?);
+    }
+
+    Ok(tasks)
+}
+
+/// Update a task's status, agent assignment, or payload. Returns the updated row.
+pub async fn update_task(
+    db: &Database,
+    task_id: &str,
+    status: Option<&str>,
+    agent_id: Option<&str>,
+    payload: Option<&str>,
+) -> Result<Option<TaskRow>> {
+    let conn = db.connect().context("DB connect")?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut set_parts = vec!["updated_at = ?1".to_string()];
+    let mut param_values: Vec<libsql::Value> = vec![libsql::Value::Text(now)];
+
+    if let Some(s) = status {
+        param_values.push(libsql::Value::Text(s.to_string()));
+        set_parts.push(format!("status = ?{}", param_values.len()));
+    }
+    if let Some(a) = agent_id {
+        param_values.push(libsql::Value::Text(a.to_string()));
+        set_parts.push(format!("agent_id = ?{}", param_values.len()));
+    }
+    if let Some(p) = payload {
+        param_values.push(libsql::Value::Text(p.to_string()));
+        set_parts.push(format!("payload = ?{}", param_values.len()));
+    }
+
+    param_values.push(libsql::Value::Text(task_id.to_string()));
+    let id_param = param_values.len();
+
+    let sql = format!(
+        "UPDATE tasks SET {} WHERE id = ?{}",
+        set_parts.join(", "),
+        id_param,
+    );
+
+    let rows_affected = conn.execute(&sql, param_values).await.context("update task")?;
+
+    if rows_affected == 0 {
+        return Ok(None);
+    }
+
+    get_task(db, task_id).await
+}
+
+/// Delete a task by ID. Returns true if a row was deleted.
+pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
+    let conn = db.connect().context("DB connect")?;
+
+    let rows_affected = conn
+        .execute(
+            "DELETE FROM tasks WHERE id = ?1",
+            libsql::params![task_id],
+        )
+        .await
+        .context("delete task")?;
+
+    Ok(rows_affected > 0)
 }

@@ -50,22 +50,36 @@ src/
 
 King runs a Socket.IO server on port 3000 (namespace `/`).
 
+### Rooms
+
+| Room | Auto-joined by | Purpose |
+|------|----------------|---------|
+| `kernel` | Agents with role: learning, building, pre-load, evaluation, skill-manage | Scoped task management broadcasts |
+
+Kernel agents are automatically joined to the `kernel` room on `agent:register`. Task change notifications (`task:changed`) are broadcast only to this room.
+
 ### Events King Receives (runners emit)
 
 | Event | Payload | Handler |
 |-------|---------|---------|
-| `agent:register` | `{ agent_id, role, capabilities }` | Upserts agent in `agent_status` table |
+| `agent:register` | `{ agent_id, role, capabilities }` | Upserts agent in `agent_status` table, joins kernel room if kernel role |
 | `agent:status` | `{ agent_id, status }` | Updates `agent_status.last_heartbeat` |
 | `agent:skill_report` | `{ agent_id, skill_id, result, score }` | Creates task row, logs to `pipeline_runs` |
 | `agent:health` | `{ agent_id, health_checks: [...] }` | Logs endpoint health results |
+| `task:create` | `{ task_type, agent_id?, payload? }` | Creates task, acks full TaskRecord |
+| `task:update` | `{ task_id, status?, agent_id?, payload? }` | Updates task, acks updated TaskRecord |
+| `task:get` | `{ task_id }` | Fetches task, acks TaskRecord |
+| `task:list` | `{ limit?, status?, agent_id? }` | Lists tasks, acks array of TaskRecord |
+| `task:delete` | `{ task_id }` | Deletes task, acks success boolean |
 
 ### Events King Emits (runners receive)
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `king:command` | `{ command, target_agent, params }` | Targeted instruction to a specific agent |
-| `king:config_update` | `{ config_type, new_config_hash }` | Broadcast on gateway.json change |
-| `pipeline:next` | `{ stage, artifact_id, metadata }` | Advance kernel pipeline |
+| Event | Payload | Scope | Description |
+|-------|---------|-------|-------------|
+| `king:command` | `{ command, target_agent, params }` | All | Targeted instruction to a specific agent |
+| `king:config_update` | `{ config_type, new_config_hash }` | All | Broadcast on gateway.json change |
+| `pipeline:next` | `{ stage, artifact_id, metadata }` | All | Advance kernel pipeline |
+| `task:changed` | `{ action, task?, task_id? }` | Kernel room | Broadcast on task create/update/delete |
 
 See `evo-common/src/messages.rs` for full struct definitions.
 
