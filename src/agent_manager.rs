@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use libsql::Database;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::task_db;
 
@@ -94,21 +94,72 @@ impl AgentRegistry {
 
 // ─── Process spawning ─────────────────────────────────────────────────────────
 
-/// Spawn a runner binary for the given agent folder.
+/// Derive the per-agent binary name from a folder name.
 ///
-/// The runner binary is expected to:
-/// - Accept `<agent-folder>` as its first argument.
-/// - Read `KING_ADDRESS` env var to connect back to king.
+/// `evo-kernel-agent-learning` → `evo-agent-learning`
+/// `evo-user-agent-my-bot`     → `evo-user-agent-my-bot` (unchanged)
+fn per_agent_binary_name(folder_name: &str) -> String {
+    if let Some(suffix) = folder_name.strip_prefix("evo-kernel-agent-") {
+        format!("evo-agent-{suffix}")
+    } else {
+        // User agents keep the folder name as-is for the binary
+        folder_name.to_string()
+    }
+}
+
+/// Spawn a runner process for the given agent folder.
+///
+/// Tries the per-agent binary first (e.g. `evo-kernel-agent-learning/evo-agent-learning`).
+/// Falls back to the generic runner binary if the per-agent binary does not exist.
 pub async fn spawn_runner(
     runner_binary: &str,
     agent_folder: &str,
     king_address: &str,
 ) -> Result<Child> {
+    let folder_path = Path::new(agent_folder);
+    let folder_name = folder_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // Try per-agent binary first
+    let agent_binary_name = per_agent_binary_name(folder_name);
+    let agent_binary_path = folder_path.join(&agent_binary_name);
+
+    if agent_binary_path.exists() {
+        info!(
+            binary = %agent_binary_path.display(),
+            folder = %agent_folder,
+            king   = %king_address,
+            "spawning per-agent binary"
+        );
+
+        let child = Command::new(&agent_binary_path)
+            .current_dir(agent_folder)
+            .env("KING_ADDRESS", king_address)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to spawn per-agent binary '{}' in '{}'",
+                    agent_binary_path.display(),
+                    agent_folder
+                )
+            })?;
+
+        return Ok(child);
+    }
+
+    // Fallback: generic runner binary
+    debug!(
+        per_agent = %agent_binary_path.display(),
+        "per-agent binary not found, falling back to generic runner"
+    );
+
     info!(
-        runner   = %runner_binary,
-        folder   = %agent_folder,
-        king     = %king_address,
-        "spawning runner process"
+        runner = %runner_binary,
+        folder = %agent_folder,
+        king   = %king_address,
+        "spawning generic runner process"
     );
 
     let child = Command::new(runner_binary)

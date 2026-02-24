@@ -1,6 +1,7 @@
 mod agent_manager;
 mod config_watcher;
 mod cron_manager;
+mod doctor;
 mod error;
 mod gateway_manager;
 mod pipeline_coordinator;
@@ -11,6 +12,7 @@ mod task_db;
 use agent_manager::AgentRegistry;
 use anyhow::{Context, Result};
 use axum::{Json, Router, extract::State, routing::{get, post}};
+use clap::{Parser, Subcommand};
 use evo_common::logging::init_logging;
 use pipeline_coordinator::PipelineCoordinator;
 use serde_json::json;
@@ -25,10 +27,41 @@ const DEFAULT_GATEWAY_CONFIG: &str = "../evo-gateway/gateway.json";
 const DEFAULT_KERNEL_AGENTS_DIR: &str = "..";
 const DEFAULT_RUNNER_BINARY: &str = "../evo-agents/target/release/evo-runner";
 
+/// evo-king — central orchestrator for the evo multi-agent system.
+#[derive(Parser)]
+#[command(name = "evo-king", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Validate (and optionally fix) the ~/.evo-agents/ installation.
+    Doctor {
+        /// Attempt to automatically fix issues.
+        #[arg(long)]
+        fix: bool,
+
+        /// Path to the evo-agents installation directory.
+        #[arg(long, default_value = "~/.evo-agents")]
+        evo_home: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Structured JSON logging to logs/king.log (+ stdout)
     let _log_guard = init_logging("king");
+
+    let cli = Cli::parse();
+
+    // ── Handle subcommands that exit early ──────────────────────────────────
+    if let Some(Commands::Doctor { fix, evo_home }) = cli.command {
+        return doctor::run_doctor(&evo_home, fix).await;
+    }
+
+    // ── Server mode (default) ───────────────────────────────────────────────
 
     let port: u16 = std::env::var("KING_PORT")
         .ok()

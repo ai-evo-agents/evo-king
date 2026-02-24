@@ -4,7 +4,9 @@ use evo_common::messages::{PipelineStage, events};
 use libsql::Database;
 use serde_json::Value;
 use socketioxide::SocketIo;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::process::Command;
 use tracing::{error, info, warn};
 
 /// Default stage timeout in seconds (5 minutes).
@@ -184,6 +186,41 @@ impl PipelineCoordinator {
                         run_id = %run_id,
                         "pipeline run completed all stages"
                     );
+
+                    // Check if this was a self-upgrade pipeline that was approved
+                    if output["build_type"].as_str() == Some("self_upgrade")
+                        && output["action"].as_str() == Some("activated")
+                    {
+                        let component = output["component"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let new_version = output["new_version"]
+                            .as_str()
+                            .unwrap_or("v0.0.0")
+                            .to_string();
+                        let rid = run_id.to_string();
+
+                        info!(
+                            run_id = %rid,
+                            component = %component,
+                            new_version = %new_version,
+                            "self-upgrade approved — triggering update.sh"
+                        );
+
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                trigger_update(&component, &new_version, &rid).await
+                            {
+                                error!(
+                                    run_id = %rid,
+                                    component = %component,
+                                    err = %e,
+                                    "update.sh failed"
+                                );
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -273,4 +310,91 @@ fn stage_to_str(stage: &PipelineStage) -> &'static str {
         PipelineStage::Evaluation => "evaluation",
         PipelineStage::SkillManage => "skill_manage",
     }
+}
+
+// ─── Self-upgrade trigger ───────────────────────────────────────────────────
+
+/// Resolve the EVO_HOME directory (~/.evo-agents).
+fn evo_home() -> PathBuf {
+    let raw = std::env::var("EVO_HOME").unwrap_or_else(|_| "~/.evo-agents".to_string());
+    if raw.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(format!("{home}{}", &raw[1..]));
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// Run `update.sh <component> <new_version>` to install a new release.
+///
+/// The update script handles: backup → download → extract → repos.json
+/// update → doctor validation → rollback on failure.
+async fn trigger_update(component: &str, new_version: &str, run_id: &str) -> Result<()> {
+    let home = evo_home();
+
+    // Look for update.sh in several locations
+    let candidates = [
+        home.join("update.sh"),
+        home.join("bin/update.sh"),
+        // During development, the script may live in the king repo
+        PathBuf::from(std::env::var("KERNEL_AGENTS_DIR").unwrap_or_else(|_| "..".into()))
+            .join("evo-king/update.sh"),
+    ];
+
+    let script = candidates.iter().find(|p| p.exists());
+
+    let script_path = match script {
+        Some(p) => p.clone(),
+        None => {
+            warn!(
+                run_id = %run_id,
+                component,
+                "update.sh not found — skipping automatic update"
+            );
+            return Ok(());
+        }
+    };
+
+    info!(
+        run_id = %run_id,
+        script = %script_path.display(),
+        component,
+        new_version,
+        "executing update.sh"
+    );
+
+    let output = Command::new("bash")
+        .arg(&script_path)
+        .arg(component)
+        .arg(new_version)
+        .env("EVO_HOME", home.to_string_lossy().as_ref())
+        .output()
+        .await
+        .context("failed to spawn update.sh")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if output.status.success() {
+        info!(
+            run_id = %run_id,
+            component,
+            new_version,
+            stdout = %stdout.trim(),
+            "update.sh completed successfully"
+        );
+    } else {
+        let code = output.status.code().unwrap_or(-1);
+        error!(
+            run_id = %run_id,
+            component,
+            new_version,
+            exit_code = code,
+            stderr = %stderr.trim(),
+            "update.sh failed — rollback should have been triggered by the script"
+        );
+        anyhow::bail!("update.sh exited with code {code}: {stderr}");
+    }
+
+    Ok(())
 }

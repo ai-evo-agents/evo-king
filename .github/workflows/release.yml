@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: evo-king
@@ -39,12 +42,19 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Use crates.io dependencies
+        shell: bash
+        run: |
+          sed -i.bak 's|evo-common.*=.*{.*path.*=.*"[^"]*".*}|evo-common = "0.6"|' Cargo.toml
+          rm -f Cargo.toml.bak
+
       - name: Build (cross)
-        uses: houseabsolute/actions-rust-cross@v0
+        uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
           target: ${{ matrix.target }}
-          args: "--locked --release"
+          args: "--release"
+          toolchain: stable
           strip: true
 
       - name: Package
@@ -53,14 +63,23 @@ jobs:
           VERSION="${{ github.ref_name }}"
           TARGET="${{ matrix.target }}"
 
+          mkdir -p staging
           if [[ "$TARGET" == *"windows"* ]]; then
             BIN="${BINARY_NAME}.exe"
             ARCHIVE="${BINARY_NAME}-${VERSION}-${TARGET}.zip"
-            7z a "$ARCHIVE" "target/${TARGET}/release/${BIN}"
+            cp "target/${TARGET}/release/${BIN}" staging/
+            cp install.sh staging/ 2>/dev/null || true
+            cp run.sh staging/ 2>/dev/null || true
+            cp update.sh staging/ 2>/dev/null || true
+            cd staging && 7z a "../${ARCHIVE}" .
           else
             BIN="${BINARY_NAME}"
             ARCHIVE="${BINARY_NAME}-${VERSION}-${TARGET}.tar.gz"
-            tar czvf "$ARCHIVE" -C "target/${TARGET}/release" "${BIN}"
+            cp "target/${TARGET}/release/${BIN}" staging/
+            cp install.sh staging/ 2>/dev/null || true
+            cp run.sh staging/ 2>/dev/null || true
+            cp update.sh staging/ 2>/dev/null || true
+            tar czvf "$ARCHIVE" -C staging .
           fi
 
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
