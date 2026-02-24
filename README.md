@@ -61,6 +61,20 @@ The gateway manager handles the full lifecycle of gateway configuration changes:
 
 ---
 
+## Agent Lifecycle
+
+At startup, king automatically discovers and spawns all kernel agents:
+
+1. Scans `AGENTS_ROOT/kernel/` for directories containing a `soul.md` file.
+2. Spawns an `evo-runner` process for each discovered agent, passing the agent folder as argument and `KING_ADDRESS` as an environment variable.
+3. Each runner connects back to king via Socket.IO and sends an `agent:register` event with its identity, capabilities, and loaded skills.
+4. King persists the full agent metadata (role, capabilities, skills, PID) to the `agent_status` database table.
+5. A background monitor watches for crashed runner processes and updates their status in the database.
+
+Registered agents can be queried via the `GET /agents` HTTP endpoint.
+
+---
+
 ## Socket.IO Protocol
 
 | Event | Direction | Payload Type | Description |
@@ -101,10 +115,13 @@ CREATE TABLE pipeline_runs (
 );
 
 CREATE TABLE agent_status (
-    agent_id TEXT PRIMARY KEY,
-    role TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'starting',
-    last_heartbeat TEXT NOT NULL
+    agent_id       TEXT PRIMARY KEY,
+    role           TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'offline',
+    last_heartbeat TEXT NOT NULL,
+    capabilities   TEXT NOT NULL DEFAULT '[]',
+    skills         TEXT NOT NULL DEFAULT '[]',
+    pid            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE config_history (
@@ -193,6 +210,17 @@ The server starts on port 3000 by default.
 | `EVO_GATEWAY_RUNNING_CONFIG` | Path to the active gateway config | `gateway-running.conf` |
 | `EVO_GATEWAY_BACKUP_DIR` | Directory for gateway config backups | `backups/` |
 | `EVO_LOG_PATH` | Path for structured JSON log output | `logs/king.log` |
+| `AGENTS_ROOT` | Path to the evo-agents repository root | `../evo-agents` |
+| `RUNNER_BINARY` | Path to the evo-runner binary | `../evo-agents/target/release/evo-runner` |
+
+---
+
+## HTTP Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Returns king service status |
+| `GET` | `/agents` | Returns all registered agents with full metadata (role, capabilities, skills, PID, status) |
 
 ---
 

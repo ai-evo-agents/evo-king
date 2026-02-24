@@ -134,7 +134,24 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
 
     let role_str = data["role"].as_str().unwrap_or("unknown");
 
-    info!(agent_id = %agent_id, role = %role_str, "agent registered");
+    // Extract capabilities and skills arrays as JSON strings for DB storage
+    let capabilities = data
+        .get("capabilities")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "[]".to_string());
+
+    let skills = data
+        .get("skills")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "[]".to_string());
+
+    info!(
+        agent_id     = %agent_id,
+        role         = %role_str,
+        capabilities = %capabilities,
+        skills       = %skills,
+        "agent registered"
+    );
 
     // Determine kernel membership via the typed AgentRole enum.
     // All non-User roles are kernel roles.
@@ -149,7 +166,24 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         info!(role = %role_str, sid = %socket.id, "joined kernel room");
     }
 
-    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, role_str, "online").await {
+    // Look up PID from registry if this agent was spawned by king
+    let pid = state
+        .agent_registry
+        .pid_by_folder_hint(role_str)
+        .await
+        .unwrap_or(0);
+
+    if let Err(e) = task_db::upsert_agent(
+        &state.db,
+        agent_id,
+        role_str,
+        "online",
+        Some(&capabilities),
+        Some(&skills),
+        Some(pid),
+    )
+    .await
+    {
         warn!(err = %e, "failed to record agent registration in DB");
     }
 }
@@ -164,7 +198,8 @@ async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
     };
     let status = data["status"].as_str().unwrap_or("heartbeat");
 
-    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, "", status).await {
+    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, "", status, None, None, None).await
+    {
         warn!(err = %e, "failed to update agent heartbeat in DB");
     }
 }

@@ -1,3 +1,4 @@
+use crate::agent_manager::AgentRegistry;
 use libsql::Database;
 use reqwest::Client;
 use socketioxide::SocketIo;
@@ -12,9 +13,9 @@ pub struct KingState {
     /// Socket.IO handle — used to broadcast events to all connected runners.
     pub io: SocketIo,
     /// HTTP client for probing gateway health.
-    #[allow(dead_code)]
     pub http_client: Arc<Client>,
     /// Filesystem path to gateway.json (watched for changes).
-    #[allow(dead_code)]
     pub gateway_config_path: String,
+    /// Registry of spawned runner processes (agent_id → PID + Child handle).
+    pub agent_registry: Arc<AgentRegistry>,
 }
