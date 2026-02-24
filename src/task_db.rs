@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use libsql::{Builder, Database};
-use tracing::info;
+use tracing::{info, warn};
 
 // ─── Database bootstrap ───────────────────────────────────────────────────────
 
@@ -72,30 +72,133 @@ pub async fn init_db(path: &str) -> Result<Database> {
     .await
     .context("create config_history table")?;
 
+    // ── Schema migrations ────────────────────────────────────────────────────
+    // Add new columns to agent_status for enhanced metadata persistence.
+    // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch the
+    // "duplicate column" error when the migration has already been applied.
+    let migrations = [
+        "ALTER TABLE agent_status ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE agent_status ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE agent_status ADD COLUMN pid INTEGER NOT NULL DEFAULT 0",
+    ];
+
+    for sql in &migrations {
+        match conn.execute(sql, ()).await {
+            Ok(_) => info!(sql = %sql, "schema migration applied"),
+            Err(e) => {
+                let err_str = e.to_string();
+                // "duplicate column" means migration already ran — safe to ignore
+                if !err_str.contains("duplicate column") {
+                    warn!(err = %err_str, sql = %sql, "schema migration warning");
+                }
+            }
+        }
+    }
+
     info!(path = %path, "database initialized");
     Ok(db)
 }
 
 // ─── Agent CRUD ───────────────────────────────────────────────────────────────
 
-/// Insert or update an agent's status. Pass `role = ""` to keep existing role.
-pub async fn upsert_agent(db: &Database, agent_id: &str, role: &str, status: &str) -> Result<()> {
+/// Insert or update an agent's status and metadata.
+///
+/// - Pass `role = ""` to keep the existing role.
+/// - Pass `capabilities = None` / `skills = None` to keep existing values.
+/// - Pass `pid = None` or `Some(0)` to keep the existing PID.
+pub async fn upsert_agent(
+    db: &Database,
+    agent_id: &str,
+    role: &str,
+    status: &str,
+    capabilities: Option<&str>,
+    skills: Option<&str>,
+    pid: Option<u32>,
+) -> Result<()> {
     let conn = db.connect().context("DB connect")?;
     let now = chrono::Utc::now().to_rfc3339();
 
+    let caps = capabilities.unwrap_or("[]");
+    let sk = skills.unwrap_or("[]");
+    let p = pid.unwrap_or(0) as i64;
+
     conn.execute(
-        "INSERT INTO agent_status (agent_id, role, status, last_heartbeat)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO agent_status (agent_id, role, status, last_heartbeat, capabilities, skills, pid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(agent_id) DO UPDATE SET
              role           = CASE WHEN ?2 = '' THEN role ELSE ?2 END,
              status         = ?3,
-             last_heartbeat = ?4",
-        libsql::params![agent_id, role, status, now.as_str()],
+             last_heartbeat = ?4,
+             capabilities   = CASE WHEN ?5 = '[]' AND capabilities != '[]' THEN capabilities ELSE ?5 END,
+             skills         = CASE WHEN ?6 = '[]' AND skills != '[]' THEN skills ELSE ?6 END,
+             pid            = CASE WHEN ?7 = 0 THEN pid ELSE ?7 END",
+        libsql::params![agent_id, role, status, now.as_str(), caps, sk, p],
     )
     .await
     .context("upsert agent status")?;
 
     Ok(())
+}
+
+/// Mark an agent as `"crashed"` by matching its role name.
+///
+/// Used by the process monitor when a runner exits unexpectedly.
+pub async fn mark_agent_crashed_by_role(db: &Database, role_hint: &str) -> Result<()> {
+    let conn = db.connect().context("DB connect")?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "UPDATE agent_status SET status = 'crashed', last_heartbeat = ?1
+         WHERE role LIKE '%' || ?2 || '%' AND status != 'crashed'",
+        libsql::params![now.as_str(), role_hint],
+    )
+    .await
+    .context("mark agent crashed")?;
+
+    Ok(())
+}
+
+// ─── Agent query ──────────────────────────────────────────────────────────────
+
+/// Row returned from agent_status queries.
+#[derive(Debug, Clone)]
+pub struct AgentRow {
+    pub agent_id: String,
+    pub role: String,
+    pub status: String,
+    pub last_heartbeat: String,
+    pub capabilities: String,
+    pub skills: String,
+    pub pid: i64,
+}
+
+/// List all registered agents ordered by agent_id.
+pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut rows = conn
+        .query(
+            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid
+             FROM agent_status ORDER BY agent_id",
+            (),
+        )
+        .await
+        .context("list agents")?;
+
+    let mut agents = Vec::new();
+    while let Some(row) = rows.next().await.context("read agent row")? {
+        agents.push(AgentRow {
+            agent_id: row.get::<String>(0).context("read agent_id")?,
+            role: row.get::<String>(1).context("read role")?,
+            status: row.get::<String>(2).context("read status")?,
+            last_heartbeat: row.get::<String>(3).context("read last_heartbeat")?,
+            capabilities: row.get::<String>(4).unwrap_or_else(|_| "[]".to_string()),
+            skills: row.get::<String>(5).unwrap_or_else(|_| "[]".to_string()),
+            pid: row.get::<i64>(6).unwrap_or(0),
+        });
+    }
+
+    Ok(agents)
 }
 
 // ─── Config history ───────────────────────────────────────────────────────────
