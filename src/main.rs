@@ -2,14 +2,16 @@ mod agent_manager;
 mod config_watcher;
 mod error;
 mod gateway_manager;
+mod pipeline_coordinator;
 mod socket_server;
 mod state;
 mod task_db;
 
 use agent_manager::AgentRegistry;
 use anyhow::{Context, Result};
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{Json, Router, extract::State, routing::{get, post}};
 use evo_common::logging::init_logging;
+use pipeline_coordinator::PipelineCoordinator;
 use serde_json::json;
 use socketioxide::SocketIo;
 use state::KingState;
@@ -61,13 +63,20 @@ async fn main() -> Result<()> {
     );
 
     let agent_registry = Arc::new(AgentRegistry::new());
+    let db_arc = Arc::new(db);
+
+    let pipeline_coordinator = Arc::new(PipelineCoordinator::new(
+        Arc::clone(&db_arc),
+        io.clone(),
+    ));
 
     let state = Arc::new(KingState {
-        db: Arc::new(db),
+        db: db_arc,
         io: io.clone(),
         http_client,
         gateway_config_path: gateway_config_path.clone(),
         agent_registry: Arc::clone(&agent_registry),
+        pipeline_coordinator: Arc::clone(&pipeline_coordinator),
     });
 
     // ── Socket.IO event handlers ──────────────────────────────────────────────
@@ -84,10 +93,19 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Pipeline timeout monitor (background task) ──────────────────────────
+    {
+        let monitor = Arc::clone(&pipeline_coordinator);
+        tokio::spawn(async move { monitor.timeout_monitor().await });
+    }
+
     // ── Axum server with Socket.IO layer ──────────────────────────────────────
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/agents", get(list_agents_handler))
+        .route("/pipeline/start", post(pipeline_start_handler))
+        .route("/pipeline/runs", get(pipeline_list_handler))
+        .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
         .layer(socket_layer)
         .with_state(Arc::clone(&state));
 
@@ -164,4 +182,76 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
+}
+
+// ─── Pipeline HTTP handlers ────────────────────────────────────────────────
+
+/// POST /pipeline/start — manually trigger a new pipeline run.
+async fn pipeline_start_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let trigger = body.get("trigger").cloned().unwrap_or(json!("manual"));
+
+    match state.pipeline_coordinator.start_run(trigger).await {
+        Ok(run_id) => {
+            info!(run_id = %run_id, "pipeline run triggered via HTTP");
+            Json(json!({ "success": true, "run_id": run_id }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /pipeline/runs — list all pipeline runs.
+async fn pipeline_list_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
+    match state.pipeline_coordinator.list_runs(100, None).await {
+        Ok(rows) => {
+            let runs: Vec<serde_json::Value> = rows
+                .iter()
+                .map(pipeline_row_to_json)
+                .collect();
+            let count = runs.len();
+            Json(json!({ "runs": runs, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /pipeline/runs/:run_id — detailed stage history for one run.
+async fn pipeline_detail_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match state.pipeline_coordinator.get_run_stages(&run_id).await {
+        Ok(stages) => {
+            let list: Vec<serde_json::Value> = stages
+                .iter()
+                .map(pipeline_row_to_json)
+                .collect();
+            let count = list.len();
+            Json(json!({ "run_id": run_id, "stages": list, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+fn pipeline_row_to_json(row: &task_db::PipelineRow) -> serde_json::Value {
+    let result_val = row
+        .result
+        .as_ref()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .unwrap_or(json!(null));
+
+    json!({
+        "id":          row.id,
+        "run_id":      row.run_id,
+        "stage":       row.stage,
+        "artifact_id": row.artifact_id,
+        "status":      row.status,
+        "agent_id":    row.agent_id,
+        "result":      result_val,
+        "error":       row.error,
+        "created_at":  row.created_at,
+        "updated_at":  row.updated_at,
+    })
 }
