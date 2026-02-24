@@ -2,7 +2,7 @@
 
 Central orchestrator for the Evo self-evolution agent system. Manages gateway config lifecycle, spawns and monitors agent runner processes, serves a Socket.IO server for bidirectional agent communication, and maintains a local task database for evolution pipeline tracking.
 
-**Status:** Skeleton — Phase 4 pending implementation.
+**Status:** Active development — agent management, pipeline coordinator, and task DB operational.
 
 ---
 
@@ -13,7 +13,9 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
 | evo-common | Shared types (dependency) |
 | evo-gateway | API aggregator — king manages its config lifecycle |
 | **evo-king** | Central orchestrator, port 3000 |
-| evo-agents | Runner binary + agent folders — runners connect to king via Socket.IO |
+| evo-agents | Runner binary — runners connect to king via Socket.IO |
+| evo-kernel-agent-* | 5 kernel agent repos (learning, building, pre-load, evaluation, skill-manage) |
+| evo-user-agent-template | Template for creating user agents |
 
 ---
 
@@ -65,11 +67,12 @@ The gateway manager handles the full lifecycle of gateway configuration changes:
 
 At startup, king automatically discovers and spawns all kernel agents:
 
-1. Scans `AGENTS_ROOT/kernel/` for directories containing a `soul.md` file.
+1. Scans `KERNEL_AGENTS_DIR` for directories matching `evo-kernel-agent-*` prefix containing a `soul.md` file.
 2. Spawns an `evo-runner` process for each discovered agent, passing the agent folder as argument and `KING_ADDRESS` as an environment variable.
 3. Each runner connects back to king via Socket.IO and sends an `agent:register` event with its identity, capabilities, and loaded skills.
-4. King persists the full agent metadata (role, capabilities, skills, PID) to the `agent_status` database table.
-5. A background monitor watches for crashed runner processes and updates their status in the database.
+4. King joins the agent to the `kernel` room and a role-specific room (e.g. `role:learning`) for targeted pipeline dispatch.
+5. King persists the full agent metadata (role, capabilities, skills, PID) to the `agent_status` database table.
+6. A background monitor watches for crashed runner processes and updates their status in the database.
 
 Registered agents can be queried via the `GET /agents` HTTP endpoint.
 
@@ -86,6 +89,7 @@ Registered agents can be queried via the `GET /agents` HTTP endpoint.
 | `king:command` | King -> Runner | `KingCommand` | Send command to specific agent |
 | `king:config_update` | King -> All | `KingConfigUpdate` | Broadcast config change notification |
 | `pipeline:next` | King -> Runner | `PipelineNext` | Advance to next pipeline stage |
+| `pipeline:stage_result` | Runner -> King | `PipelineStageResult` | Agent reports stage completion/failure |
 
 ---
 
@@ -106,10 +110,13 @@ CREATE TABLE tasks (
 
 CREATE TABLE pipeline_runs (
     id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL DEFAULT '',
     stage TEXT NOT NULL,
-    artifact_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
+    agent_id TEXT NOT NULL DEFAULT '',
     result TEXT,
+    error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -135,19 +142,22 @@ CREATE TABLE config_history (
 
 ---
 
-## Evolution Pipeline
+## Pipeline Coordinator
 
-The king orchestrates a multi-stage pipeline across kernel agents:
+The `PipelineCoordinator` manages the evolution pipeline state machine:
 
-1. **Learning agent** discovers a potential skill and emits `agent:skill_report`.
-2. **King** creates a task in the DB and dispatches to the **Building agent** via `pipeline:next`.
-3. **Building agent** packages the skill and reports back.
-4. **King** dispatches to the **Pre-load agent** for validation.
-5. **Pre-load agent** health-checks the skill APIs and reports back.
-6. **King** dispatches to the **Evaluation agent** for scoring.
-7. **Evaluation agent** tests quality and reports a score.
-8. **King** dispatches to the **Skill Manage agent** with the evaluation results.
-9. **Skill Manage agent** decides: activate, hold, or discard.
+```
+Learning → Building → PreLoad → Evaluation → SkillManage → [complete]
+```
+
+**Flow:**
+1. `POST /pipeline/start` or internal trigger creates a new run and emits `pipeline:next` to `role:learning` room.
+2. Learning agent processes discovery, emits `pipeline:stage_result` with status `completed` and output.
+3. Coordinator advances to next stage: creates new DB record, emits `pipeline:next` to `role:building` room.
+4. Process repeats through all 5 stages. Failure at any stage stops the pipeline.
+5. A background timeout monitor marks stale stages as `timed_out` (default: 5 minutes).
+
+**Role rooms:** Each agent joins a `role:{role_name}` room on registration, enabling targeted `pipeline:next` dispatch.
 
 ---
 
@@ -155,13 +165,15 @@ The king orchestrates a multi-stage pipeline across kernel agents:
 
 ```
 src/
-  main.rs              Entry point: init DB, start Socket.IO server, start watchers, start agent manager
-  config_watcher.rs    Watch gateway.config via notify crate, emit change events internally
-  gateway_manager.rs   Config lifecycle: test -> health check -> swap -> backup or revert
-  agent_manager.rs     Spawn/stop/monitor runner processes, track PIDs, restart on crash
-  socket_server.rs     socketioxide event handlers for all Socket.IO events
-  task_db.rs           Turso/libSQL local database management
-  logger.rs            Structured JSON logging to logs/king.log
+  main.rs                  Entry point: init DB, Socket.IO, pipeline coordinator, HTTP routes
+  config_watcher.rs        Watch gateway.config via notify crate, emit change events internally
+  gateway_manager.rs       Config lifecycle: test -> health check -> swap -> backup or revert
+  agent_manager.rs         Discover evo-kernel-agent-* repos, spawn/stop/monitor runner processes
+  pipeline_coordinator.rs  Pipeline state machine: start/advance/timeout pipeline runs
+  socket_server.rs         socketioxide event handlers for all Socket.IO events
+  task_db.rs               Turso/libSQL database management (agents, tasks, pipeline runs)
+  state.rs                 Shared application state (DB, Socket.IO, registry, coordinator)
+  error.rs                 Error types
 ```
 
 ---
@@ -181,7 +193,7 @@ toml = "0.8"
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-evo-common = { git = "https://github.com/ai-evo-agents/evo-common" }
+evo-common = "0.2"
 ```
 
 ---
@@ -210,7 +222,7 @@ The server starts on port 3000 by default.
 | `EVO_GATEWAY_RUNNING_CONFIG` | Path to the active gateway config | `gateway-running.conf` |
 | `EVO_GATEWAY_BACKUP_DIR` | Directory for gateway config backups | `backups/` |
 | `EVO_LOG_PATH` | Path for structured JSON log output | `logs/king.log` |
-| `AGENTS_ROOT` | Path to the evo-agents repository root | `../evo-agents` |
+| `KERNEL_AGENTS_DIR` | Directory containing `evo-kernel-agent-*` repos | `..` (parent dir) |
 | `RUNNER_BINARY` | Path to the evo-runner binary | `../evo-agents/target/release/evo-runner` |
 
 ---
@@ -220,7 +232,10 @@ The server starts on port 3000 by default.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns king service status |
-| `GET` | `/agents` | Returns all registered agents with full metadata (role, capabilities, skills, PID, status) |
+| `GET` | `/agents` | Returns all registered agents with full metadata |
+| `POST` | `/pipeline/start` | Trigger a new pipeline run (body: `{"trigger": "manual"}`) |
+| `GET` | `/pipeline/runs` | List all pipeline run stages |
+| `GET` | `/pipeline/runs/:run_id` | Detailed stage history for a specific run |
 
 ---
 
