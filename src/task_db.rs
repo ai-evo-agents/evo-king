@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use libsql::{Builder, Database};
 use tracing::{info, warn};
 
+// serde_json is a workspace dep; used for diagnostic JSON in mark_agent_failed_by_role
+#[allow(unused_imports)]
+use serde_json;
+
 // ─── Database bootstrap ───────────────────────────────────────────────────────
 
 /// Open (or create) the local libSQL database and create all tables.
@@ -71,6 +75,24 @@ pub async fn init_db(path: &str) -> Result<Database> {
     )
     .await
     .context("create config_history table")?;
+
+    // Cron job registry — system and user-defined recurring tasks
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cron_jobs (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL UNIQUE,
+            schedule    TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1,
+            last_run_at TEXT,
+            next_run_at TEXT,
+            last_status TEXT,
+            last_error  TEXT,
+            created_at  TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create cron_jobs table")?;
 
     // ── Schema migrations ────────────────────────────────────────────────────
     // Add new columns to agent_status for enhanced metadata persistence.
@@ -564,6 +586,152 @@ pub async fn get_timed_out_stages(db: &Database, timeout_seconds: i64) -> Result
     }
 
     Ok(timed_out)
+}
+
+// ─── Cron jobs ────────────────────────────────────────────────────────────────
+
+/// Row returned from cron_jobs queries.
+#[derive(Debug, Clone)]
+pub struct CronJobRow {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+/// Insert or update a cron job record.
+///
+/// If a job with the same `name` already exists its `schedule` and `enabled`
+/// fields are preserved unless `overwrite = true`.
+pub async fn upsert_cron_job(
+    db: &Database,
+    name: &str,
+    schedule: &str,
+    enabled: bool,
+) -> Result<String> {
+    let conn = db.connect().context("DB connect")?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let enabled_int = if enabled { 1i64 } else { 0i64 };
+
+    conn.execute(
+        "INSERT INTO cron_jobs (id, name, schedule, enabled, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(name) DO UPDATE SET
+             schedule = ?3,
+             enabled  = ?4",
+        libsql::params![id.as_str(), name, schedule, enabled_int, now.as_str()],
+    )
+    .await
+    .context("upsert cron_job")?;
+
+    // Return the actual id (may differ from generated uuid if row already existed)
+    let mut rows = conn
+        .query(
+            "SELECT id FROM cron_jobs WHERE name = ?1",
+            libsql::params![name],
+        )
+        .await
+        .context("fetch cron job id")?;
+
+    let existing_id = if let Some(row) = rows.next().await.context("read cron id row")? {
+        row.get::<String>(0).context("read id")?
+    } else {
+        id
+    };
+
+    Ok(existing_id)
+}
+
+/// Update a cron job after it has run.
+pub async fn update_cron_run(
+    db: &Database,
+    name: &str,
+    status: &str,
+    error: Option<&str>,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = db.connect().context("DB connect")?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let err = error.unwrap_or("");
+    let next = next_run_at.unwrap_or("");
+
+    conn.execute(
+        "UPDATE cron_jobs SET
+             last_run_at = ?1,
+             last_status = ?2,
+             last_error  = ?3,
+             next_run_at = CASE WHEN ?4 = '' THEN next_run_at ELSE ?4 END
+         WHERE name = ?5",
+        libsql::params![now.as_str(), status, err, next, name],
+    )
+    .await
+    .context("update cron run")?;
+
+    Ok(())
+}
+
+/// Return all cron jobs ordered by name.
+pub async fn list_cron_jobs(db: &Database) -> Result<Vec<CronJobRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, name, schedule, enabled, last_run_at, next_run_at,
+                    last_status, last_error, created_at
+             FROM cron_jobs ORDER BY name",
+            (),
+        )
+        .await
+        .context("list cron jobs")?;
+
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().await.context("read cron row")? {
+        jobs.push(CronJobRow {
+            id: row.get::<String>(0).context("read id")?,
+            name: row.get::<String>(1).context("read name")?,
+            schedule: row.get::<String>(2).context("read schedule")?,
+            enabled: row.get::<i64>(3).unwrap_or(1) != 0,
+            last_run_at: row.get::<String>(4).ok(),
+            next_run_at: row.get::<String>(5).ok(),
+            last_status: row.get::<String>(6).ok(),
+            last_error: row.get::<String>(7).ok(),
+            created_at: row.get::<String>(8).context("read created_at")?,
+        });
+    }
+
+    Ok(jobs)
+}
+
+// ─── Agent failure tracking ───────────────────────────────────────────────────
+
+/// Mark an agent as `"failed"` (all retries exhausted) by matching its role.
+///
+/// Unlike `mark_agent_crashed_by_role`, this status indicates that king gave up
+/// attempting to respawn the agent and operator intervention is required.
+pub async fn mark_agent_failed_by_role(db: &Database, role_hint: &str, error: &str) -> Result<()> {
+    let conn = db.connect().context("DB connect")?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Store the error in the `capabilities` JSON field as a diagnostic payload
+    // so it appears in the `GET /agents` response without a schema change.
+    let error_json = serde_json::json!({ "spawn_error": error }).to_string();
+
+    conn.execute(
+        "UPDATE agent_status SET status = 'failed', last_heartbeat = ?1,
+              capabilities = ?2
+         WHERE role LIKE '%' || ?3 || '%' AND status != 'failed'",
+        libsql::params![now.as_str(), error_json.as_str(), role_hint],
+    )
+    .await
+    .context("mark agent failed")?;
+
+    Ok(())
 }
 
 /// List all pipeline runs (most recent first), limited and optionally filtered by status.

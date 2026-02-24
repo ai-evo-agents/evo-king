@@ -1,5 +1,6 @@
 mod agent_manager;
 mod config_watcher;
+mod cron_manager;
 mod error;
 mod gateway_manager;
 mod pipeline_coordinator;
@@ -106,6 +107,10 @@ async fn main() -> Result<()> {
         .route("/pipeline/start", post(pipeline_start_handler))
         .route("/pipeline/runs", get(pipeline_list_handler))
         .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
+        // ── Admin endpoints ──────────────────────────────────────────────────
+        .route("/admin/config-sync", post(admin_config_sync_handler))
+        .route("/admin/crons", get(admin_list_crons_handler))
+        .route("/admin/crons/{name}/run", post(admin_run_cron_handler))
         .layer(socket_layer)
         .with_state(Arc::clone(&state));
 
@@ -136,14 +141,45 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Process monitor (background task) ────────────────────────────────────
+    // ── Process monitor (background task, with respawn retry) ────────────────
     {
         let monitor_registry = Arc::clone(&agent_registry);
         let monitor_db = Arc::clone(&state.db);
+        let monitor_binary = runner_binary.clone();
+        let monitor_addr = format!("http://0.0.0.0:{port}");
         tokio::spawn(agent_manager::monitor_processes(
             monitor_registry,
             monitor_db,
+            monitor_binary,
+            monitor_addr,
         ));
+    }
+
+    // ── Heartbeat watcher (background task) ───────────────────────────────────
+    {
+        let hb_db = Arc::clone(&state.db);
+        let hb_registry = Arc::clone(&agent_registry);
+        let hb_binary = runner_binary.clone();
+        let hb_addr = format!("http://0.0.0.0:{port}");
+        let hb_dir = kernel_agents_dir.clone();
+        tokio::spawn(agent_manager::heartbeat_watch_loop(
+            hb_db,
+            hb_registry,
+            hb_binary,
+            hb_addr,
+            hb_dir,
+        ));
+    }
+
+    // ── Cron manager (init system jobs + start scheduler) ─────────────────────
+    {
+        let cron_db = Arc::clone(&state.db);
+        if let Err(e) = cron_manager::init_system_crons(&cron_db).await {
+            tracing::error!(err = %e, "failed to seed system cron jobs");
+        }
+        let cron_db2 = Arc::clone(&state.db);
+        let cron_io = state.io.clone();
+        tokio::spawn(cron_manager::run(cron_db2, cron_io));
     }
 
     axum::serve(listener, app).await.context("Server error")?;
@@ -254,4 +290,82 @@ fn pipeline_row_to_json(row: &task_db::PipelineRow) -> serde_json::Value {
         "created_at":  row.created_at,
         "updated_at":  row.updated_at,
     })
+}
+
+// ─── Admin HTTP handlers ──────────────────────────────────────────────────────
+
+/// POST /admin/config-sync
+///
+/// Broadcasts `king:config_update` to all connected agents, prompting them to
+/// re-validate their gateway config.  Called by the update agent after it has
+/// committed new dependency versions.
+async fn admin_config_sync_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    let payload = json!({
+        "trigger": "config_sync",
+        "reason": "post_dependency_update",
+    });
+
+    match state.io.emit(
+        evo_common::messages::events::KING_CONFIG_UPDATE,
+        &payload,
+    ) {
+        Ok(_) => {
+            info!("config-sync broadcast sent to all agents");
+            Json(json!({ "success": true }))
+        }
+        Err(e) => {
+            tracing::error!(err = %e, "config-sync broadcast failed");
+            Json(json!({ "success": false, "error": e.to_string() }))
+        }
+    }
+}
+
+/// GET /admin/crons — list all cron jobs and their last run status.
+async fn admin_list_crons_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    match task_db::list_cron_jobs(&state.db).await {
+        Ok(jobs) => {
+            let list: Vec<serde_json::Value> = jobs
+                .iter()
+                .map(|j| {
+                    json!({
+                        "id":          j.id,
+                        "name":        j.name,
+                        "schedule":    j.schedule,
+                        "enabled":     j.enabled,
+                        "last_run_at": j.last_run_at,
+                        "next_run_at": j.next_run_at,
+                        "last_status": j.last_status,
+                        "last_error":  j.last_error,
+                        "created_at":  j.created_at,
+                    })
+                })
+                .collect();
+            let count = list.len();
+            Json(json!({ "crons": list, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /admin/crons/:name/run — manually trigger a cron job immediately.
+async fn admin_run_cron_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let db = Arc::clone(&state.db);
+    let io = state.io.clone();
+
+    info!(cron = %name, "manual cron trigger via HTTP");
+
+    match cron_manager::run_now(&name, db, io).await {
+        Ok(()) => Json(json!({ "success": true, "cron": name })),
+        Err(e) => {
+            tracing::warn!(cron = %name, err = %e, "manual cron trigger failed");
+            Json(json!({ "success": false, "error": e.to_string() }))
+        }
+    }
 }
