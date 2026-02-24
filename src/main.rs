@@ -19,7 +19,7 @@ use tracing::info;
 const DEFAULT_PORT: u16 = 3000;
 const DEFAULT_DB_PATH: &str = "king.db";
 const DEFAULT_GATEWAY_CONFIG: &str = "../evo-gateway/gateway.json";
-const DEFAULT_AGENTS_ROOT: &str = "../evo-agents";
+const DEFAULT_KERNEL_AGENTS_DIR: &str = "..";
 const DEFAULT_RUNNER_BINARY: &str = "../evo-agents/target/release/evo-runner";
 
 #[tokio::main]
@@ -37,8 +37,8 @@ async fn main() -> Result<()> {
     let gateway_config_path =
         std::env::var("GATEWAY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_GATEWAY_CONFIG.to_string());
 
-    let agents_root =
-        std::env::var("AGENTS_ROOT").unwrap_or_else(|_| DEFAULT_AGENTS_ROOT.to_string());
+    let kernel_agents_dir =
+        std::env::var("KERNEL_AGENTS_DIR").unwrap_or_else(|_| DEFAULT_KERNEL_AGENTS_DIR.to_string());
 
     let runner_binary =
         std::env::var("RUNNER_BINARY").unwrap_or_else(|_| DEFAULT_RUNNER_BINARY.to_string());
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     // ── Spawn kernel agents AFTER server is listening ─────────────────────────
     {
         let registry = Arc::clone(&agent_registry);
-        let root = agents_root.clone();
+        let root = kernel_agents_dir.clone();
         let binary = runner_binary.clone();
         let king_address = format!("http://0.0.0.0:{port}");
         tokio::spawn(async move {

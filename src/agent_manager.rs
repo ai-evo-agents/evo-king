@@ -98,16 +98,32 @@ pub async fn spawn_runner(
 
 // ─── Agent folder discovery ───────────────────────────────────────────────────
 
-/// Return all kernel agent folders that contain a `soul.md` file.
+/// Return all kernel agent directories that contain a `soul.md` file.
 ///
-/// Looks under `<agents_root>/kernel/`.
-pub fn discover_kernel_agents(agents_root: &str) -> Vec<PathBuf> {
-    let kernel_dir = PathBuf::from(agents_root).join("kernel");
+/// Scans `<agents_dir>` for directories matching `evo-kernel-agent-*` with a
+/// `soul.md` file inside. This supports the split-repo layout where each kernel
+/// agent is an independent repository cloned side-by-side.
+pub fn discover_kernel_agents(agents_dir: &str) -> Vec<PathBuf> {
+    discover_agents_by_prefix(agents_dir, "evo-kernel-agent-")
+}
 
-    let entries = match std::fs::read_dir(&kernel_dir) {
+/// Return all user agent directories that contain a `soul.md` file.
+///
+/// Scans `<agents_dir>` for directories matching `evo-user-agent-*` with a
+/// `soul.md` file inside.
+#[allow(dead_code)]
+pub fn discover_user_agents(agents_dir: &str) -> Vec<PathBuf> {
+    discover_agents_by_prefix(agents_dir, "evo-user-agent-")
+}
+
+/// Scan a directory for agent repos matching a name prefix and containing `soul.md`.
+fn discover_agents_by_prefix(dir_path: &str, prefix: &str) -> Vec<PathBuf> {
+    let dir = PathBuf::from(dir_path);
+
+    let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            warn!(dir = %kernel_dir.display(), err = %e, "cannot read kernel agents dir");
+            warn!(dir = %dir.display(), prefix = %prefix, err = %e, "cannot read agents directory");
             return vec![];
         }
     };
@@ -115,6 +131,12 @@ pub fn discover_kernel_agents(agents_root: &str) -> Vec<PathBuf> {
     let mut agents: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with(prefix))
+                .unwrap_or(false)
+        })
         .filter(|e| e.path().join("soul.md").exists())
         .map(|e| e.path())
         .collect();
@@ -127,21 +149,22 @@ pub fn discover_kernel_agents(agents_root: &str) -> Vec<PathBuf> {
 
 /// Discover and spawn all kernel agents.
 ///
+/// Scans `kernel_agents_dir` for `evo-kernel-agent-*` repos with `soul.md`.
 /// Returns the list of folder names that were successfully spawned.
 pub async fn spawn_all_kernel_agents(
     registry: &AgentRegistry,
-    agents_root: &str,
+    kernel_agents_dir: &str,
     runner_binary: &str,
     king_address: &str,
 ) -> Vec<String> {
-    let agent_dirs = discover_kernel_agents(agents_root);
+    let agent_dirs = discover_kernel_agents(kernel_agents_dir);
 
     if agent_dirs.is_empty() {
-        warn!(root = %agents_root, "no kernel agents discovered");
+        warn!(dir = %kernel_agents_dir, "no kernel agents discovered — looking for evo-kernel-agent-* dirs");
         return vec![];
     }
 
-    info!(count = agent_dirs.len(), root = %agents_root, "discovered kernel agent folders");
+    info!(count = agent_dirs.len(), dir = %kernel_agents_dir, "discovered kernel agent folders");
 
     let mut spawned = Vec::new();
 
