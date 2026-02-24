@@ -1,4 +1,5 @@
 use crate::agent_manager::AgentRegistry;
+use crate::pipeline_coordinator::PipelineCoordinator;
 use libsql::Database;
 use reqwest::Client;
 use socketioxide::SocketIo;
@@ -18,4 +19,6 @@ pub struct KingState {
     pub gateway_config_path: String,
     /// Registry of spawned runner processes (agent_id → PID + Child handle).
     pub agent_registry: Arc<AgentRegistry>,
+    /// Pipeline coordinator — manages the evolution pipeline state machine.
+    pub pipeline_coordinator: Arc<PipelineCoordinator>,
 }

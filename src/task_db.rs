@@ -80,6 +80,10 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE agent_status ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE agent_status ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE agent_status ADD COLUMN pid INTEGER NOT NULL DEFAULT 0",
+        // Phase 5: pipeline coordinator columns
+        "ALTER TABLE pipeline_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE pipeline_runs ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE pipeline_runs ADD COLUMN error TEXT",
     ];
 
     for sql in &migrations {
@@ -406,4 +410,193 @@ pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
         .context("delete task")?;
 
     Ok(rows_affected > 0)
+}
+
+// ─── Pipeline runs ──────────────────────────────────────────────────────────
+
+/// Row returned from pipeline_runs queries.
+#[derive(Debug, Clone)]
+pub struct PipelineRow {
+    pub id: String,
+    pub run_id: String,
+    pub stage: String,
+    pub artifact_id: String,
+    pub status: String,
+    pub agent_id: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn row_to_pipeline(row: &libsql::Row) -> Result<PipelineRow> {
+    Ok(PipelineRow {
+        id: row.get::<String>(0).context("read id")?,
+        run_id: row.get::<String>(1).context("read run_id")?,
+        stage: row.get::<String>(2).context("read stage")?,
+        artifact_id: row.get::<String>(3).context("read artifact_id")?,
+        status: row.get::<String>(4).context("read status")?,
+        agent_id: row.get::<String>(5).unwrap_or_default(),
+        result: row.get::<String>(6).ok(),
+        error: row.get::<String>(7).ok(),
+        created_at: row.get::<String>(8).context("read created_at")?,
+        updated_at: row.get::<String>(9).context("read updated_at")?,
+    })
+}
+
+/// Create a new pipeline stage record.
+pub async fn create_pipeline_stage(
+    db: &Database,
+    run_id: &str,
+    stage: &str,
+    artifact_id: &str,
+) -> Result<PipelineRow> {
+    let conn = db.connect().context("DB connect")?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO pipeline_runs (id, run_id, stage, artifact_id, status, agent_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'running', '', ?5, ?6)",
+        libsql::params![id.as_str(), run_id, stage, artifact_id, now.as_str(), now.as_str()],
+    )
+    .await
+    .context("create pipeline stage")?;
+
+    Ok(PipelineRow {
+        id,
+        run_id: run_id.to_string(),
+        stage: stage.to_string(),
+        artifact_id: artifact_id.to_string(),
+        status: "running".to_string(),
+        agent_id: String::new(),
+        result: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+/// Update a pipeline stage with completion status, agent, result, and optional error.
+pub async fn update_pipeline_stage(
+    db: &Database,
+    id: &str,
+    status: &str,
+    agent_id: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    let conn = db.connect().context("DB connect")?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let res = result.unwrap_or("");
+    let err = error.unwrap_or("");
+
+    conn.execute(
+        "UPDATE pipeline_runs SET status = ?1, agent_id = ?2, result = ?3, error = ?4, updated_at = ?5
+         WHERE id = ?6",
+        libsql::params![status, agent_id, res, err, now.as_str(), id],
+    )
+    .await
+    .context("update pipeline stage")?;
+
+    Ok(())
+}
+
+/// Get all stages for a specific pipeline run, ordered by creation time.
+pub async fn get_pipeline_run_stages(db: &Database, run_id: &str) -> Result<Vec<PipelineRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+             FROM pipeline_runs WHERE run_id = ?1 ORDER BY created_at ASC",
+            libsql::params![run_id],
+        )
+        .await
+        .context("get pipeline stages")?;
+
+    let mut stages = Vec::new();
+    while let Some(row) = rows.next().await.context("read pipeline row")? {
+        stages.push(row_to_pipeline(&row)?);
+    }
+
+    Ok(stages)
+}
+
+/// Get the most recent stage for each active (running) pipeline run.
+pub async fn get_active_pipeline_runs(db: &Database) -> Result<Vec<PipelineRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+             FROM pipeline_runs WHERE status = 'running' ORDER BY created_at DESC",
+            (),
+        )
+        .await
+        .context("get active pipeline runs")?;
+
+    let mut runs = Vec::new();
+    while let Some(row) = rows.next().await.context("read pipeline row")? {
+        runs.push(row_to_pipeline(&row)?);
+    }
+
+    Ok(runs)
+}
+
+/// Find pipeline stages that have been running longer than `timeout_seconds`.
+pub async fn get_timed_out_stages(db: &Database, timeout_seconds: i64) -> Result<Vec<PipelineRow>> {
+    let conn = db.connect().context("DB connect")?;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(timeout_seconds)).to_rfc3339();
+
+    let mut rows = conn
+        .query(
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+             FROM pipeline_runs WHERE status = 'running' AND created_at < ?1",
+            libsql::params![cutoff.as_str()],
+        )
+        .await
+        .context("get timed out stages")?;
+
+    let mut timed_out = Vec::new();
+    while let Some(row) = rows.next().await.context("read pipeline row")? {
+        timed_out.push(row_to_pipeline(&row)?);
+    }
+
+    Ok(timed_out)
+}
+
+/// List all pipeline runs (most recent first), limited and optionally filtered by status.
+pub async fn list_pipeline_runs(
+    db: &Database,
+    limit: u32,
+    status_filter: Option<&str>,
+) -> Result<Vec<PipelineRow>> {
+    let conn = db.connect().context("DB connect")?;
+
+    let mut sql = String::from(
+        "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+         FROM pipeline_runs WHERE 1=1",
+    );
+    let mut param_values: Vec<libsql::Value> = Vec::new();
+
+    if let Some(status) = status_filter {
+        param_values.push(libsql::Value::Text(status.to_string()));
+        sql.push_str(&format!(" AND status = ?{}", param_values.len()));
+    }
+
+    param_values.push(libsql::Value::Integer(i64::from(limit)));
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ?{}",
+        param_values.len()
+    ));
+
+    let mut rows = conn.query(&sql, param_values).await.context("list pipeline runs")?;
+    let mut runs = Vec::new();
+
+    while let Some(row) = rows.next().await.context("read pipeline row")? {
+        runs.push(row_to_pipeline(&row)?);
+    }
+
+    Ok(runs)
 }

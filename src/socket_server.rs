@@ -1,5 +1,5 @@
 use crate::{state::KingState, task_db};
-use evo_common::messages::{AgentRole, events};
+use evo_common::messages::{AgentRole, PipelineStage, events};
 use socketioxide::SocketIo;
 use socketioxide::extract::{AckSender, Data, SocketRef};
 use std::sync::Arc;
@@ -22,6 +22,9 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         let s_status = Arc::clone(&state);
         let s_report = Arc::clone(&state);
         let s_health = Arc::clone(&state);
+
+        // Pipeline stage result handler arc
+        let s_stage_result = Arc::clone(&state);
 
         // Task management handler arcs
         let s_task_create = Arc::clone(&state);
@@ -63,6 +66,15 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             move |_s: SocketRef, Data::<serde_json::Value>(data)| {
                 let state = Arc::clone(&s_health);
                 async move { on_health(data, state).await }
+            },
+        );
+
+        // pipeline:stage_result — agent reports pipeline stage completion
+        socket.on(
+            events::PIPELINE_STAGE_RESULT,
+            move |_s: SocketRef, Data::<serde_json::Value>(data)| {
+                let state = Arc::clone(&s_stage_result);
+                async move { on_pipeline_stage_result(data, state).await }
             },
         );
 
@@ -163,7 +175,20 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
 
     if is_kernel {
         let _ = socket.join(events::ROOM_KERNEL);
-        info!(role = %role_str, sid = %socket.id, "joined kernel room");
+
+        // Also join role-specific room for targeted pipeline:next dispatch
+        let role_room = format!(
+            "{}{}",
+            events::ROOM_ROLE_PREFIX,
+            role_str.replace('-', "_")
+        );
+        let _ = socket.join(role_room.clone());
+        info!(
+            role = %role_str,
+            sid = %socket.id,
+            rooms = %format!("{}, {}", events::ROOM_KERNEL, role_room),
+            "joined kernel + role rooms"
+        );
     }
 
     // Look up PID from registry if this agent was spawned by king
@@ -230,6 +255,56 @@ async fn on_health(data: serde_json::Value, state: Arc<KingState>) {
     .await
     {
         warn!(err = %e, "failed to persist health report task");
+    }
+}
+
+// ─── Pipeline event handlers ────────────────────────────────────────────────
+
+async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>) {
+    let run_id = match data["run_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            warn!("pipeline:stage_result received without run_id, ignoring");
+            return;
+        }
+    };
+
+    let stage_str = match data["stage"].as_str() {
+        Some(s) => s,
+        None => {
+            warn!(run_id = %run_id, "pipeline:stage_result missing stage");
+            return;
+        }
+    };
+
+    let stage: PipelineStage = match serde_json::from_value(data["stage"].clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(run_id = %run_id, stage = %stage_str, err = %e, "invalid pipeline stage");
+            return;
+        }
+    };
+
+    let agent_id = data["agent_id"].as_str().unwrap_or("unknown");
+    let status = data["status"].as_str().unwrap_or("completed");
+    let artifact_id = data["artifact_id"].as_str().unwrap_or("");
+    let output = data.get("output").cloned().unwrap_or(serde_json::Value::Null);
+    let error_msg = data["error"].as_str();
+
+    info!(
+        run_id = %run_id,
+        stage = %stage_str,
+        agent_id = %agent_id,
+        status = %status,
+        "pipeline stage result received"
+    );
+
+    if let Err(e) = state
+        .pipeline_coordinator
+        .on_stage_result(run_id, &stage, agent_id, status, artifact_id, &output, error_msg)
+        .await
+    {
+        warn!(err = %e, run_id = %run_id, "failed to process pipeline stage result");
     }
 }
 
