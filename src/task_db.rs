@@ -1,10 +1,26 @@
 use anyhow::{Context, Result};
-use libsql::{Builder, Database};
+use libsql::{Builder, Connection, Database};
 use tracing::{info, warn};
 
 // serde_json is a workspace dep; used for diagnostic JSON in mark_agent_failed_by_role
 #[allow(unused_imports)]
 use serde_json;
+
+// ─── Connection helper ────────────────────────────────────────────────────────
+
+/// Create a libSQL connection and immediately set `busy_timeout=5000`.
+///
+/// SQLite only allows one writer at a time. Without a busy timeout, concurrent
+/// writes (e.g. 6 agents all registering at startup) immediately fail with
+/// SQLITE_BUSY. A 5-second timeout makes writers retry before giving up.
+/// The WAL journal mode (set once in `init_db`) further improves throughput.
+async fn db_connect(db: &Database) -> Result<Connection> {
+    let conn = db.connect().context("DB connect")?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;")
+        .await
+        .context("set busy_timeout")?;
+    Ok(conn)
+}
 
 // ─── Database bootstrap ───────────────────────────────────────────────────────
 
@@ -16,6 +32,17 @@ pub async fn init_db(path: &str) -> Result<Database> {
         .context("Failed to open local database")?;
 
     let conn = db.connect().context("Failed to connect to database")?;
+
+    // Enable WAL journal mode (persistent, survives restarts) for better
+    // concurrency: multiple readers can coexist with one writer.
+    // Set a 5-second busy timeout so concurrent writers retry instead of
+    // immediately returning SQLITE_BUSY (which caused 4/6 agent:register
+    // upserts to fail when all agents connect simultaneously).
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
+    )
+    .await
+    .context("Failed to set WAL + busy_timeout pragmas")?;
 
     // Tasks table — generic work units
     conn.execute(
@@ -141,7 +168,7 @@ pub async fn upsert_agent(
     skills: Option<&str>,
     pid: Option<u32>,
 ) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
 
     let caps = capabilities.unwrap_or("[]");
@@ -170,7 +197,7 @@ pub async fn upsert_agent(
 ///
 /// Used by the process monitor when a runner exits unexpectedly.
 pub async fn mark_agent_crashed_by_role(db: &Database, role_hint: &str) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
 
     conn.execute(
@@ -200,7 +227,7 @@ pub struct AgentRow {
 
 /// List all registered agents ordered by agent_id.
 pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut rows = conn
         .query(
@@ -236,7 +263,7 @@ pub async fn log_config_event(
     action: &str,
     backup_path: Option<&str>,
 ) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let backup = backup_path.unwrap_or("");
@@ -285,7 +312,7 @@ pub async fn create_task(
     agent_id: Option<&str>,
     payload: &str,
 ) -> Result<TaskRow> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let agent = agent_id.unwrap_or("");
@@ -318,7 +345,7 @@ pub async fn create_task(
 
 /// Fetch a single task by ID.
 pub async fn get_task(db: &Database, task_id: &str) -> Result<Option<TaskRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut rows = conn
         .query(
@@ -342,7 +369,7 @@ pub async fn list_tasks(
     status_filter: Option<&str>,
     agent_filter: Option<&str>,
 ) -> Result<Vec<TaskRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut sql = String::from(
         "SELECT id, task_type, status, agent_id, payload, created_at, updated_at FROM tasks WHERE 1=1",
@@ -382,7 +409,7 @@ pub async fn update_task(
     agent_id: Option<&str>,
     payload: Option<&str>,
 ) -> Result<Option<TaskRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
 
     let mut set_parts = vec!["updated_at = ?1".to_string()];
@@ -424,7 +451,7 @@ pub async fn update_task(
 
 /// Delete a task by ID. Returns true if a row was deleted.
 pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let rows_affected = conn
         .execute("DELETE FROM tasks WHERE id = ?1", libsql::params![task_id])
@@ -473,7 +500,7 @@ pub async fn create_pipeline_stage(
     stage: &str,
     artifact_id: &str,
 ) -> Result<PipelineRow> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -508,7 +535,7 @@ pub async fn update_pipeline_stage(
     result: Option<&str>,
     error: Option<&str>,
 ) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let res = result.unwrap_or("");
     let err = error.unwrap_or("");
@@ -526,7 +553,7 @@ pub async fn update_pipeline_stage(
 
 /// Get all stages for a specific pipeline run, ordered by creation time.
 pub async fn get_pipeline_run_stages(db: &Database, run_id: &str) -> Result<Vec<PipelineRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut rows = conn
         .query(
@@ -547,7 +574,7 @@ pub async fn get_pipeline_run_stages(db: &Database, run_id: &str) -> Result<Vec<
 
 /// Get the most recent stage for each active (running) pipeline run.
 pub async fn get_active_pipeline_runs(db: &Database) -> Result<Vec<PipelineRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut rows = conn
         .query(
@@ -568,7 +595,7 @@ pub async fn get_active_pipeline_runs(db: &Database) -> Result<Vec<PipelineRow>>
 
 /// Find pipeline stages that have been running longer than `timeout_seconds`.
 pub async fn get_timed_out_stages(db: &Database, timeout_seconds: i64) -> Result<Vec<PipelineRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(timeout_seconds)).to_rfc3339();
 
     let mut rows = conn
@@ -614,7 +641,7 @@ pub async fn upsert_cron_job(
     schedule: &str,
     enabled: bool,
 ) -> Result<String> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let enabled_int = if enabled { 1i64 } else { 0i64 };
@@ -656,7 +683,7 @@ pub async fn update_cron_run(
     error: Option<&str>,
     next_run_at: Option<&str>,
 ) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let err = error.unwrap_or("");
     let next = next_run_at.unwrap_or("");
@@ -678,7 +705,7 @@ pub async fn update_cron_run(
 
 /// Return all cron jobs ordered by name.
 pub async fn list_cron_jobs(db: &Database) -> Result<Vec<CronJobRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut rows = conn
         .query(
@@ -715,7 +742,7 @@ pub async fn list_cron_jobs(db: &Database) -> Result<Vec<CronJobRow>> {
 /// Unlike `mark_agent_crashed_by_role`, this status indicates that king gave up
 /// attempting to respawn the agent and operator intervention is required.
 pub async fn mark_agent_failed_by_role(db: &Database, role_hint: &str, error: &str) -> Result<()> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
 
     // Store the error in the `capabilities` JSON field as a diagnostic payload
@@ -740,7 +767,7 @@ pub async fn list_pipeline_runs(
     limit: u32,
     status_filter: Option<&str>,
 ) -> Result<Vec<PipelineRow>> {
-    let conn = db.connect().context("DB connect")?;
+    let conn = db_connect(db).await?;
 
     let mut sql = String::from(
         "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
