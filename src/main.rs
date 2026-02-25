@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
         .route("/tasks", get(tasks_list_handler))
         .route("/task/current", get(task_current_handler))
         .route("/task/{task_id}/logs", get(task_logs_handler))
+        .route("/task/{task_id}/subtasks", get(task_subtasks_handler))
         // ── Debug endpoints ─────────────────────────────────────────────────
         .route("/debug/prompt", post(debug_prompt_handler))
         // ── Admin endpoints ──────────────────────────────────────────────────
@@ -490,6 +491,7 @@ async fn config_history_handler(State(state): State<Arc<KingState>>) -> Json<ser
 struct TasksQuery {
     status: Option<String>,
     agent_id: Option<String>,
+    parent_id: Option<String>,
     limit: Option<u32>,
 }
 
@@ -564,6 +566,7 @@ fn task_row_to_json_http(r: &task_db::TaskRow) -> serde_json::Value {
         "run_id":        r.run_id,
         "current_stage": r.current_stage,
         "summary":       r.summary,
+        "parent_id":     r.parent_id,
         "payload":       payload,
         "created_at":    r.created_at,
         "updated_at":    r.updated_at,
@@ -581,6 +584,7 @@ async fn tasks_list_handler(
         limit,
         params.status.as_deref(),
         params.agent_id.as_deref(),
+        params.parent_id.as_deref(),
     )
     .await
     {
@@ -640,6 +644,29 @@ async fn task_logs_handler(
                 })
                 .collect();
             Json(json!({ "logs": list, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /task/:task_id/subtasks — list subtasks of a task with progress info.
+async fn task_subtasks_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Query(params): Query<TasksQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(100).min(500);
+    match task_db::list_subtasks(&state.db, &task_id, limit).await {
+        Ok(rows) => {
+            let subtasks: Vec<serde_json::Value> = rows.iter().map(task_row_to_json_http).collect();
+            let (total, completed) = task_db::count_subtasks(&state.db, &task_id)
+                .await
+                .unwrap_or((0, 0));
+            Json(json!({
+                "subtasks": subtasks,
+                "count": subtasks.len(),
+                "progress": { "total": total, "completed": completed },
+            }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }

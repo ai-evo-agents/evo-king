@@ -148,6 +148,8 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE tasks ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE tasks ADD COLUMN current_stage TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+        // Phase 7: subtask hierarchy support
+        "ALTER TABLE tasks ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''",
     ];
 
     for sql in &migrations {
@@ -344,12 +346,13 @@ pub struct TaskRow {
     pub run_id: String,
     pub current_stage: String,
     pub summary: String,
+    pub parent_id: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
 /// SELECT column list for task queries — must match `row_to_task` field order.
-const TASK_COLS: &str = "id, task_type, status, agent_id, payload, run_id, current_stage, summary, created_at, updated_at";
+const TASK_COLS: &str = "id, task_type, status, agent_id, payload, run_id, current_stage, summary, parent_id, created_at, updated_at";
 
 fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
     Ok(TaskRow {
@@ -361,8 +364,9 @@ fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
         run_id: row.get::<String>(5).unwrap_or_default(),
         current_stage: row.get::<String>(6).unwrap_or_default(),
         summary: row.get::<String>(7).unwrap_or_default(),
-        created_at: row.get::<String>(8).context("read created_at")?,
-        updated_at: row.get::<String>(9).context("read updated_at")?,
+        parent_id: row.get::<String>(8).unwrap_or_default(),
+        created_at: row.get::<String>(9).context("read created_at")?,
+        updated_at: row.get::<String>(10).context("read updated_at")?,
     })
 }
 
@@ -371,6 +375,7 @@ fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
 /// `run_id` links the task to a pipeline run (1:1).
 /// `current_stage` is the initial pipeline stage (e.g. "learning").
 /// `summary` is a human-readable description of the current activity.
+/// `parent_id` links this task as a subtask of another task (empty = top-level).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     db: &Database,
@@ -381,6 +386,7 @@ pub async fn create_task(
     run_id: &str,
     current_stage: &str,
     summary: &str,
+    parent_id: &str,
 ) -> Result<TaskRow> {
     let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -388,8 +394,8 @@ pub async fn create_task(
     let agent = agent_id.unwrap_or("");
 
     conn.execute(
-        "INSERT INTO tasks (id, task_type, status, agent_id, payload, run_id, current_stage, summary, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO tasks (id, task_type, status, agent_id, payload, run_id, current_stage, summary, parent_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         libsql::params![
             id.as_str(),
             task_type,
@@ -399,6 +405,7 @@ pub async fn create_task(
             run_id,
             current_stage,
             summary,
+            parent_id,
             now.as_str(),
             now.as_str()
         ],
@@ -415,6 +422,7 @@ pub async fn create_task(
         run_id: run_id.to_string(),
         current_stage: current_stage.to_string(),
         summary: summary.to_string(),
+        parent_id: parent_id.to_string(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -436,12 +444,13 @@ pub async fn get_task(db: &Database, task_id: &str) -> Result<Option<TaskRow>> {
     }
 }
 
-/// List tasks with optional status and agent filters, ordered by newest first.
+/// List tasks with optional status, agent, and parent_id filters, ordered by newest first.
 pub async fn list_tasks(
     db: &Database,
     limit: u32,
     status_filter: Option<&str>,
     agent_filter: Option<&str>,
+    parent_id_filter: Option<&str>,
 ) -> Result<Vec<TaskRow>> {
     let conn = db_connect(db).await?;
 
@@ -455,6 +464,10 @@ pub async fn list_tasks(
     if let Some(agent) = agent_filter {
         param_values.push(libsql::Value::Text(agent.to_string()));
         sql.push_str(&format!(" AND agent_id = ?{}", param_values.len()));
+    }
+    if let Some(pid) = parent_id_filter {
+        param_values.push(libsql::Value::Text(pid.to_string()));
+        sql.push_str(&format!(" AND parent_id = ?{}", param_values.len()));
     }
 
     param_values.push(libsql::Value::Integer(i64::from(limit)));
@@ -592,6 +605,49 @@ pub async fn get_task_by_run_id(db: &Database, run_id: &str) -> Result<Option<Ta
     match rows.next().await.context("read row")? {
         Some(row) => Ok(Some(row_to_task(&row)?)),
         None => Ok(None),
+    }
+}
+
+/// List all subtasks of a parent task, ordered by creation time.
+pub async fn list_subtasks(db: &Database, parent_id: &str, limit: u32) -> Result<Vec<TaskRow>> {
+    let conn = db_connect(db).await?;
+
+    let sql = format!(
+        "SELECT {} FROM tasks WHERE parent_id = ?1 ORDER BY created_at ASC LIMIT ?2",
+        TASK_COLS
+    );
+    let mut rows = conn
+        .query(&sql, libsql::params![parent_id, i64::from(limit)])
+        .await
+        .context("list subtasks")?;
+
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next().await.context("read row")? {
+        tasks.push(row_to_task(&row)?);
+    }
+    Ok(tasks)
+}
+
+/// Count subtasks of a parent task. Returns `(total, completed)`.
+pub async fn count_subtasks(db: &Database, parent_id: &str) -> Result<(u32, u32)> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*), SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)
+             FROM tasks WHERE parent_id = ?1",
+            libsql::params![parent_id],
+        )
+        .await
+        .context("count subtasks")?;
+
+    match rows.next().await.context("read count row")? {
+        Some(row) => {
+            let total = row.get::<i64>(0).unwrap_or(0) as u32;
+            let completed = row.get::<i64>(1).unwrap_or(0) as u32;
+            Ok((total, completed))
+        }
+        None => Ok((0, 0)),
     }
 }
 

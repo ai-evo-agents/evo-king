@@ -286,6 +286,7 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
         "",
         "",
         "",
+        "",
     )
     .await
     {
@@ -303,6 +304,7 @@ async fn on_health(data: serde_json::Value, state: Arc<KingState>) {
         "completed",
         Some(agent_id),
         &data.to_string(),
+        "",
         "",
         "",
         "",
@@ -399,6 +401,7 @@ fn task_row_to_json(row: &task_db::TaskRow) -> serde_json::Value {
         "run_id":        row.run_id,
         "current_stage": row.current_stage,
         "summary":       row.summary,
+        "parent_id":     row.parent_id,
         "payload":       payload,
         "created_at":    row.created_at,
         "updated_at":    row.updated_at,
@@ -427,9 +430,10 @@ async fn on_task_create(
         .get("payload")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".to_string());
+    let parent_id = data["parent_id"].as_str().unwrap_or("");
 
     match task_db::create_task(
-        &state.db, task_type, "pending", agent_id, &payload, "", "", "",
+        &state.db, task_type, "pending", agent_id, &payload, "", "", "", parent_id,
     )
     .await
     {
@@ -547,8 +551,17 @@ async fn on_task_list(data: serde_json::Value, ack: AckSender, state: Arc<KingSt
     let limit = data["limit"].as_u64().unwrap_or(50).min(MAX_TASK_LIMIT) as u32;
     let status_filter = data["status"].as_str();
     let agent_filter = data["agent_id"].as_str();
+    let parent_id_filter = data["parent_id"].as_str();
 
-    match task_db::list_tasks(&state.db, limit, status_filter, agent_filter).await {
+    match task_db::list_tasks(
+        &state.db,
+        limit,
+        status_filter,
+        agent_filter,
+        parent_id_filter,
+    )
+    .await
+    {
         Ok(rows) => {
             let tasks: Vec<serde_json::Value> = rows.iter().map(task_row_to_json).collect();
             let count = tasks.len();

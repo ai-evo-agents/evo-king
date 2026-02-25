@@ -59,6 +59,7 @@ impl PipelineCoordinator {
             &run_id,
             stage_str,
             &summary,
+            "",
         )
         .await
         .context("create pipeline task")?;
@@ -232,6 +233,16 @@ impl PipelineCoordinator {
                 }
             }
 
+            // Create subtasks from evaluation output if present
+            if stage == &PipelineStage::Evaluation
+                && let Some(subtasks_arr) = output.get("subtasks").and_then(|v| v.as_array())
+                && !subtasks_arr.is_empty()
+                && let Some(ref t) = task
+            {
+                self.create_subtasks(t, subtasks_arr, run_id, agent_id)
+                    .await;
+            }
+
             match next_stage(stage) {
                 Some(next) => {
                     let next_str = stage_to_str(&next);
@@ -388,6 +399,68 @@ impl PipelineCoordinator {
         Ok(())
     }
 
+    /// Create subtasks from evaluation agent output.
+    ///
+    /// Each entry in `subtask_defs` should have `task_type`, `summary`, and
+    /// optionally `payload`. The created tasks are linked to `parent_task` via
+    /// `parent_id` and share the same `run_id`.
+    async fn create_subtasks(
+        &self,
+        parent_task: &task_db::TaskRow,
+        subtask_defs: &[serde_json::Value],
+        run_id: &str,
+        agent_id: &str,
+    ) {
+        for (i, def) in subtask_defs.iter().enumerate() {
+            let task_type = def["task_type"].as_str().unwrap_or("subtask");
+            let payload = def.get("payload").cloned().unwrap_or(serde_json::json!({}));
+            let default_summary = format!("Subtask {}", i + 1);
+            let summary = def["summary"].as_str().unwrap_or(&default_summary);
+
+            match task_db::create_task(
+                &self.db,
+                task_type,
+                "pending",
+                None,
+                &payload.to_string(),
+                run_id,
+                "",
+                summary,
+                &parent_task.id,
+            )
+            .await
+            {
+                Ok(subtask) => {
+                    info!(
+                        parent_id = %parent_task.id,
+                        subtask_id = %subtask.id,
+                        task_type = %task_type,
+                        "subtask created from evaluation output"
+                    );
+                    self.broadcast_task_changed(&subtask);
+
+                    let _ = task_db::create_task_log(
+                        &self.db,
+                        &parent_task.id,
+                        "info",
+                        &format!("Subtask created: {}", summary),
+                        &serde_json::json!({"subtask_id": subtask.id}).to_string(),
+                        agent_id,
+                        "evaluation",
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent_task.id,
+                        err = %e,
+                        "failed to create subtask"
+                    );
+                }
+            }
+        }
+    }
+
     /// Background task that periodically checks for timed-out pipeline stages
     /// and marks them as `timed_out`.
     pub async fn timeout_monitor(self: Arc<Self>) {
@@ -480,6 +553,7 @@ impl PipelineCoordinator {
                 "run_id":        task.run_id,
                 "current_stage": task.current_stage,
                 "summary":       task.summary,
+                "parent_id":     task.parent_id,
                 "payload":       task.payload,
                 "created_at":    task.created_at,
                 "updated_at":    task.updated_at,
