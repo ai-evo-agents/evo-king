@@ -10,7 +10,7 @@ use tracing::{info, warn};
 /// writes (e.g. 6 agents all registering at startup) immediately fail with
 /// SQLITE_BUSY. A 5-second timeout makes writers retry before giving up.
 /// The WAL journal mode (set once in `init_db`) further improves throughput.
-async fn db_connect(db: &Database) -> Result<Connection> {
+pub(crate) async fn db_connect(db: &Database) -> Result<Connection> {
     let conn = db.connect().context("DB connect")?;
     conn.execute_batch("PRAGMA busy_timeout=5000;")
         .await
@@ -131,6 +131,73 @@ pub async fn init_db(path: &str) -> Result<Database> {
     )
     .await
     .context("create task_logs table")?;
+
+    // Memories — core memory records (L0/L1/L2 tiers stored in memory_tiers)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS memories (
+            id              TEXT PRIMARY KEY,
+            scope           TEXT NOT NULL DEFAULT 'system',
+            category        TEXT NOT NULL DEFAULT 'general',
+            key             TEXT NOT NULL DEFAULT '',
+            metadata        TEXT NOT NULL DEFAULT '{}',
+            tags            TEXT NOT NULL DEFAULT '',
+            agent_id        TEXT NOT NULL DEFAULT '',
+            run_id          TEXT NOT NULL DEFAULT '',
+            skill_id        TEXT NOT NULL DEFAULT '',
+            relevance_score REAL NOT NULL DEFAULT 0.0,
+            access_count    INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create memories table")?;
+
+    // Memory tiers — L0 (abstract), L1 (overview), L2 (full content)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS memory_tiers (
+            id         TEXT PRIMARY KEY,
+            memory_id  TEXT NOT NULL,
+            tier       TEXT NOT NULL,
+            content    TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create memory_tiers table")?;
+
+    // Task-memory junction — binds memories to tasks for fast filtering
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_memories (
+            id         TEXT PRIMARY KEY,
+            task_id    TEXT NOT NULL,
+            memory_id  TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create task_memories table")?;
+
+    // Memory indexes
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
+         CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+         CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id);
+         CREATE INDEX IF NOT EXISTS idx_memories_run_id ON memories(run_id);
+         CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);
+         CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+         CREATE INDEX IF NOT EXISTS idx_memory_tiers_memory_id ON memory_tiers(memory_id);
+         CREATE INDEX IF NOT EXISTS idx_memory_tiers_tier ON memory_tiers(tier);
+         CREATE INDEX IF NOT EXISTS idx_task_memories_task_id ON task_memories(task_id);
+         CREATE INDEX IF NOT EXISTS idx_task_memories_memory_id ON task_memories(memory_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_memories_unique ON task_memories(task_id, memory_id);",
+    )
+    .await
+    .context("create memory indexes")?;
 
     // ── Schema migrations ────────────────────────────────────────────────────
     // Add new columns to agent_status for enhanced metadata persistence.

@@ -4,6 +4,7 @@ mod cron_manager;
 mod doctor;
 mod error;
 mod gateway_manager;
+mod memory_db;
 mod pipeline_coordinator;
 mod socket_server;
 mod state;
@@ -164,6 +165,32 @@ async fn main() -> Result<()> {
         .route("/admin/config-sync", post(admin_config_sync_handler))
         .route("/admin/crons", get(admin_list_crons_handler))
         .route("/admin/crons/{name}/run", post(admin_run_cron_handler))
+        // ── Memory endpoints ───────────────────────────────────────────────
+        .route(
+            "/memories",
+            get(memories_list_handler).post(memory_create_handler),
+        )
+        .route("/memories/search", post(memory_search_handler))
+        .route("/memories/stats", get(memory_stats_handler))
+        .route(
+            "/memories/{memory_id}",
+            get(memory_get_handler)
+                .put(memory_update_handler)
+                .delete(memory_delete_handler),
+        )
+        .route(
+            "/memories/{memory_id}/tiers",
+            get(memory_tiers_handler).post(memory_tier_upsert_handler),
+        )
+        .route(
+            "/memories/{memory_id}/tiers/{tier}",
+            get(memory_tier_get_handler).delete(memory_tier_delete_handler),
+        )
+        .route("/memories/{memory_id}/tasks", get(memory_tasks_handler))
+        .route(
+            "/task/{task_id}/memories",
+            get(task_memories_handler).post(task_memory_bind_handler),
+        )
         // Static dashboard files as fallback (API routes take priority)
         .fallback_service(ServeDir::new(&dashboard_dir).append_index_html_on_directories(true))
         // Layers must come AFTER fallback so they wrap the entire router
@@ -669,5 +696,385 @@ async fn task_subtasks_handler(
             }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+// ─── Memory HTTP handlers ────────────────────────────────────────────────────
+
+/// Query parameters for GET /memories.
+#[derive(Deserialize)]
+struct MemoriesQuery {
+    scope: Option<String>,
+    category: Option<String>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    skill_id: Option<String>,
+    tag: Option<String>,
+    limit: Option<u32>,
+}
+
+fn memory_row_to_json(row: &memory_db::MemoryRow) -> serde_json::Value {
+    let metadata = serde_json::from_str::<serde_json::Value>(&row.metadata).unwrap_or(json!({}));
+    let tags: Vec<&str> = if row.tags.is_empty() {
+        vec![]
+    } else {
+        row.tags.split(',').map(|t| t.trim()).collect()
+    };
+    json!({
+        "id":              row.id,
+        "scope":           row.scope,
+        "category":        row.category,
+        "key":             row.key,
+        "metadata":        metadata,
+        "tags":            tags,
+        "agent_id":        row.agent_id,
+        "run_id":          row.run_id,
+        "skill_id":        row.skill_id,
+        "relevance_score": row.relevance_score,
+        "access_count":    row.access_count,
+        "created_at":      row.created_at,
+        "updated_at":      row.updated_at,
+    })
+}
+
+fn tier_row_to_json(row: &memory_db::MemoryTierRow) -> serde_json::Value {
+    json!({
+        "id":         row.id,
+        "memory_id":  row.memory_id,
+        "tier":       row.tier,
+        "content":    row.content,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    })
+}
+
+/// GET /memories — list memories with optional filters.
+async fn memories_list_handler(
+    State(state): State<Arc<KingState>>,
+    Query(params): Query<MemoriesQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(50).min(500);
+    match memory_db::list_memories(
+        &state.db,
+        limit,
+        params.scope.as_deref(),
+        params.category.as_deref(),
+        params.agent_id.as_deref(),
+        params.run_id.as_deref(),
+        params.skill_id.as_deref(),
+        params.tag.as_deref(),
+    )
+    .await
+    {
+        Ok(rows) => {
+            let memories: Vec<serde_json::Value> = rows.iter().map(memory_row_to_json).collect();
+            let count = memories.len();
+            Json(json!({ "memories": memories, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /memories — create a memory with optional tiers.
+async fn memory_create_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let scope = body["scope"].as_str().unwrap_or("system");
+    let category = body["category"].as_str().unwrap_or("general");
+    let key = body["key"].as_str().unwrap_or("");
+    let metadata = body
+        .get("metadata")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    let tags_val = body.get("tags");
+    let tags = match tags_val {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    };
+    let agent_id = body["agent_id"].as_str().unwrap_or("");
+    let run_id = body["run_id"].as_str().unwrap_or("");
+    let skill_id = body["skill_id"].as_str().unwrap_or("");
+    let relevance_score = body["relevance_score"].as_f64().unwrap_or(0.0);
+
+    match memory_db::create_memory(
+        &state.db,
+        scope,
+        category,
+        key,
+        &metadata,
+        &tags,
+        agent_id,
+        run_id,
+        skill_id,
+        relevance_score,
+    )
+    .await
+    {
+        Ok(row) => {
+            // Upsert tiers if provided
+            if let Some(serde_json::Value::Array(tiers)) = body.get("tiers") {
+                for tier_entry in tiers {
+                    let tier = tier_entry["tier"].as_str().unwrap_or("l0");
+                    let content = tier_entry["content"].as_str().unwrap_or("");
+                    if let Err(e) = memory_db::upsert_tier(&state.db, &row.id, tier, content).await
+                    {
+                        tracing::warn!(err = %e, tier = %tier, "failed to create tier");
+                    }
+                }
+            }
+            // Bind to task if task_id provided
+            if let Some(task_id) = body["task_id"].as_str().filter(|s| !s.is_empty()) {
+                let _ = memory_db::bind_task_memory(&state.db, task_id, &row.id).await;
+            }
+            // Broadcast memory:changed
+            let _ = state.io.to("kernel").emit(
+                evo_common::messages::events::MEMORY_CHANGED,
+                json!({ "action": "created", "memory_id": row.id }),
+            );
+            let _ = state.io.to("dashboard").emit(
+                "dashboard:event",
+                json!({ "event": "memory:changed", "data": { "action": "created", "memory_id": row.id } }),
+            );
+            Json(json!({ "success": true, "memory": memory_row_to_json(&row) }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// POST /memories/search — text search across memory tiers.
+async fn memory_search_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let query = body["query"].as_str().unwrap_or("");
+    let limit = body["limit"].as_u64().unwrap_or(20) as u32;
+    let scope = body["scope"].as_str();
+    let category = body["category"].as_str();
+    let agent_id = body["agent_id"].as_str();
+    let tier = body["tier"].as_str();
+
+    match memory_db::search_memories(&state.db, query, limit, scope, category, agent_id, tier).await
+    {
+        Ok(rows) => {
+            let memories: Vec<serde_json::Value> = rows.iter().map(memory_row_to_json).collect();
+            let count = memories.len();
+            Json(json!({ "memories": memories, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /memories/stats — count memories by scope.
+async fn memory_stats_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
+    match memory_db::count_memories_by_scope(&state.db).await {
+        Ok(counts) => {
+            let stats: serde_json::Map<String, serde_json::Value> = counts
+                .into_iter()
+                .map(|(scope, count)| (scope, json!(count)))
+                .collect();
+            Json(json!({ "stats": stats }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /memories/:memory_id — get a single memory with all tiers.
+async fn memory_get_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match memory_db::get_memory(&state.db, &memory_id).await {
+        Ok(Some(row)) => {
+            let mut mem = memory_row_to_json(&row);
+            if let Ok(tiers) = memory_db::get_tiers(&state.db, &memory_id).await {
+                mem["tiers"] = json!(tiers.iter().map(tier_row_to_json).collect::<Vec<_>>());
+            }
+            if let Ok(task_ids) = memory_db::list_tasks_for_memory(&state.db, &memory_id).await {
+                mem["task_ids"] = json!(task_ids);
+            }
+            Json(json!({ "memory": mem }))
+        }
+        Ok(None) => Json(json!({ "error": "not found" })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// PUT /memories/:memory_id — update a memory (partial).
+async fn memory_update_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let metadata = body.get("metadata").map(|v| v.to_string());
+    let tags = body.get("tags").and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    });
+    let relevance_score = body["relevance_score"].as_f64();
+
+    match memory_db::update_memory(
+        &state.db,
+        &memory_id,
+        metadata.as_deref(),
+        tags.as_deref(),
+        relevance_score,
+    )
+    .await
+    {
+        Ok(Some(row)) => {
+            // Upsert tiers if provided
+            if let Some(serde_json::Value::Array(tiers)) = body.get("tiers") {
+                for tier_entry in tiers {
+                    let tier = tier_entry["tier"].as_str().unwrap_or("l0");
+                    let content = tier_entry["content"].as_str().unwrap_or("");
+                    let _ = memory_db::upsert_tier(&state.db, &memory_id, tier, content).await;
+                }
+            }
+            let _ = state.io.to("kernel").emit(
+                evo_common::messages::events::MEMORY_CHANGED,
+                json!({ "action": "updated", "memory_id": memory_id }),
+            );
+            let _ = state.io.to("dashboard").emit(
+                "dashboard:event",
+                json!({ "event": "memory:changed", "data": { "action": "updated", "memory_id": memory_id } }),
+            );
+            Json(json!({ "success": true, "memory": memory_row_to_json(&row) }))
+        }
+        Ok(None) => Json(json!({ "success": false, "error": "not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// DELETE /memories/:memory_id — delete a memory and its tiers/bindings.
+async fn memory_delete_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match memory_db::delete_memory(&state.db, &memory_id).await {
+        Ok(true) => {
+            let _ = state.io.to("kernel").emit(
+                evo_common::messages::events::MEMORY_CHANGED,
+                json!({ "action": "deleted", "memory_id": memory_id }),
+            );
+            let _ = state.io.to("dashboard").emit(
+                "dashboard:event",
+                json!({ "event": "memory:changed", "data": { "action": "deleted", "memory_id": memory_id } }),
+            );
+            Json(json!({ "success": true }))
+        }
+        Ok(false) => Json(json!({ "success": false, "error": "not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /memories/:memory_id/tiers — list all tiers for a memory.
+async fn memory_tiers_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match memory_db::get_tiers(&state.db, &memory_id).await {
+        Ok(tiers) => {
+            let list: Vec<serde_json::Value> = tiers.iter().map(tier_row_to_json).collect();
+            Json(json!({ "tiers": list, "count": list.len() }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /memories/:memory_id/tiers — upsert a tier for a memory.
+async fn memory_tier_upsert_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let tier = match body["tier"].as_str() {
+        Some(t) if !t.is_empty() => t,
+        _ => return Json(json!({ "success": false, "error": "tier is required (l0, l1, or l2)" })),
+    };
+    let content = body["content"].as_str().unwrap_or("");
+
+    match memory_db::upsert_tier(&state.db, &memory_id, tier, content).await {
+        Ok(row) => Json(json!({ "success": true, "tier": tier_row_to_json(&row) })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /memories/:memory_id/tiers/:tier — get a specific tier.
+async fn memory_tier_get_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path((memory_id, tier)): axum::extract::Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    match memory_db::get_tier(&state.db, &memory_id, &tier).await {
+        Ok(Some(row)) => Json(json!({ "tier": tier_row_to_json(&row) })),
+        Ok(None) => Json(json!({ "error": "not found" })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// DELETE /memories/:memory_id/tiers/:tier — delete a specific tier.
+async fn memory_tier_delete_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path((memory_id, tier)): axum::extract::Path<(String, String)>,
+) -> Json<serde_json::Value> {
+    match memory_db::delete_tier(&state.db, &memory_id, &tier).await {
+        Ok(true) => Json(json!({ "success": true })),
+        Ok(false) => Json(json!({ "success": false, "error": "not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /memories/:memory_id/tasks — list tasks bound to a memory.
+async fn memory_tasks_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(memory_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match memory_db::list_tasks_for_memory(&state.db, &memory_id).await {
+        Ok(task_ids) => {
+            let count = task_ids.len();
+            Json(json!({ "task_ids": task_ids, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /task/:task_id/memories — list memories bound to a task.
+async fn task_memories_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let limit = 100u32;
+    match memory_db::list_memories_for_task(&state.db, &task_id, limit).await {
+        Ok(rows) => {
+            let memories: Vec<serde_json::Value> = rows.iter().map(memory_row_to_json).collect();
+            let count = memories.len();
+            Json(json!({ "memories": memories, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// POST /task/:task_id/memories — bind a memory to a task.
+async fn task_memory_bind_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let memory_id = match body["memory_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => return Json(json!({ "success": false, "error": "memory_id is required" })),
+    };
+
+    match memory_db::bind_task_memory(&state.db, &task_id, memory_id).await {
+        Ok(_) => Json(json!({ "success": true })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
     }
 }

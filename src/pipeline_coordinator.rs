@@ -1,4 +1,4 @@
-use crate::task_db;
+use crate::{memory_db, task_db};
 use anyhow::{Context, Result};
 use evo_common::messages::{PipelineStage, events};
 use libsql::Database;
@@ -179,6 +179,11 @@ impl PipelineCoordinator {
                 "pipeline run failed at stage"
             );
 
+            // Extract memory for the failed stage
+            let task_id = task.as_ref().map(|t| t.id.as_str());
+            self.extract_stage_memory(run_id, stage_str, agent_id, artifact_id, output, task_id)
+                .await;
+
             if let Some(ref t) = task {
                 let fail_summary = format!("Failed at {} — {}", stage_str, err_text);
                 let _ = task_db::update_task(
@@ -216,6 +221,11 @@ impl PipelineCoordinator {
 
         // If completed, advance to the next stage
         if status == "completed" {
+            // Extract memory for the completed stage
+            let task_id = task.as_ref().map(|t| t.id.as_str());
+            self.extract_stage_memory(run_id, stage_str, agent_id, artifact_id, output, task_id)
+                .await;
+
             // Log stage completion
             if let Some(ref t) = task {
                 let log = task_db::create_task_log(
@@ -537,6 +547,68 @@ impl PipelineCoordinator {
                 }
             }
         }
+    }
+
+    // ── Memory extraction ─────────────────────────────────────────────────────
+
+    /// Auto-extract a memory record for a completed or failed pipeline stage.
+    ///
+    /// Creates a `pipeline` scoped memory with L0/L1/L2 tiers and optionally
+    /// binds it to the pipeline task.
+    async fn extract_stage_memory(
+        &self,
+        run_id: &str,
+        stage: &str,
+        agent_id: &str,
+        artifact_id: &str,
+        output: &Value,
+        task_id: Option<&str>,
+    ) {
+        let category = match stage {
+            "learning" => "resource",
+            "building" => "fact",
+            "pre_load" => "fact",
+            "evaluation" => "case",
+            "skill_manage" => "event",
+            _ => "fact",
+        };
+
+        let key = format!("memory://pipeline/{run_id}/{stage}/{artifact_id}");
+
+        let row = match memory_db::create_memory(
+            &self.db, "pipeline", category, &key, "{}", "", agent_id, run_id, "", 0.5,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(run_id = %run_id, stage = %stage, err = %e, "failed to extract pipeline memory");
+                return;
+            }
+        };
+
+        // L0: one-line abstract
+        let l0 = format!("{stage} completed by {agent_id} for artifact '{artifact_id}'");
+        // L1: first 2000 chars of pretty-printed output
+        let pretty = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+        let l1: String = pretty.chars().take(2000).collect();
+        // L2: full output
+        let l2 = output.to_string();
+
+        let _ = memory_db::upsert_tier(&self.db, &row.id, "l0", &l0).await;
+        let _ = memory_db::upsert_tier(&self.db, &row.id, "l1", &l1).await;
+        let _ = memory_db::upsert_tier(&self.db, &row.id, "l2", &l2).await;
+
+        if let Some(tid) = task_id {
+            let _ = memory_db::bind_task_memory(&self.db, tid, &row.id).await;
+        }
+
+        info!(
+            run_id = %run_id,
+            stage = %stage,
+            memory_id = %row.id,
+            "pipeline stage memory extracted"
+        );
     }
 
     // ── Broadcast helpers ─────────────────────────────────────────────────────

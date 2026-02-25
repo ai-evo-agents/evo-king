@@ -1,4 +1,4 @@
-use crate::{state::KingState, task_db};
+use crate::{memory_db, state::KingState, task_db};
 use evo_common::messages::{AgentRole, PipelineStage, events};
 use socketioxide::SocketIo;
 use socketioxide::extract::{AckSender, Data, SocketRef};
@@ -35,6 +35,12 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         let s_task_get = Arc::clone(&state);
         let s_task_list = Arc::clone(&state);
         let s_task_delete = Arc::clone(&state);
+
+        // Memory handler arcs
+        let s_memory_store = Arc::clone(&state);
+        let s_memory_query = Arc::clone(&state);
+        let s_memory_update = Arc::clone(&state);
+        let s_memory_delete = Arc::clone(&state);
 
         // dashboard:subscribe — dashboard clients join a read-only room
         socket.on(
@@ -157,6 +163,44 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
                 let state = Arc::clone(&s_task_delete);
                 async move { on_task_delete(s, data, ack, state).await }
+            },
+        );
+
+        // ── Memory events ────────────────────────────────────────────────────
+
+        // memory:store — agent stores a learned memory
+        socket.on(
+            events::MEMORY_STORE,
+            move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
+                let state = Arc::clone(&s_memory_store);
+                async move { on_memory_store(s, data, ack, state).await }
+            },
+        );
+
+        // memory:query — agent queries for relevant memories
+        socket.on(
+            events::MEMORY_QUERY,
+            move |_s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
+                let state = Arc::clone(&s_memory_query);
+                async move { on_memory_query(data, ack, state).await }
+            },
+        );
+
+        // memory:update — agent updates an existing memory
+        socket.on(
+            events::MEMORY_UPDATE,
+            move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
+                let state = Arc::clone(&s_memory_update);
+                async move { on_memory_update(s, data, ack, state).await }
+            },
+        );
+
+        // memory:delete — agent deletes a memory
+        socket.on(
+            events::MEMORY_DELETE,
+            move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
+                let state = Arc::clone(&s_memory_delete);
+                async move { on_memory_delete(s, data, ack, state).await }
             },
         );
 
@@ -613,6 +657,266 @@ async fn on_task_delete(
         }
         Err(e) => {
             warn!(err = %e, "failed to delete task");
+            ack_error(ack, "internal server error");
+        }
+    }
+}
+
+// ─── Memory event handlers ──────────────────────────────────────────────────
+
+async fn on_memory_store(
+    socket: SocketRef,
+    data: serde_json::Value,
+    ack: AckSender,
+    state: Arc<KingState>,
+) {
+    let scope = data["scope"].as_str().unwrap_or("system");
+    let category = data["category"].as_str().unwrap_or("general");
+    let key = data["key"].as_str().unwrap_or("");
+    let metadata = data
+        .get("metadata")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    let tags = match data.get("tags") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    };
+    let agent_id = data["agent_id"].as_str().unwrap_or("");
+    let run_id = data["run_id"].as_str().unwrap_or("");
+    let skill_id = data["skill_id"].as_str().unwrap_or("");
+    let relevance_score = data["relevance_score"].as_f64().unwrap_or(0.0);
+
+    match memory_db::create_memory(
+        &state.db,
+        scope,
+        category,
+        key,
+        &metadata,
+        &tags,
+        agent_id,
+        run_id,
+        skill_id,
+        relevance_score,
+    )
+    .await
+    {
+        Ok(row) => {
+            // Upsert tiers if provided
+            if let Some(serde_json::Value::Array(tiers)) = data.get("tiers") {
+                for tier_entry in tiers {
+                    let tier = tier_entry["tier"].as_str().unwrap_or("l0");
+                    let content = tier_entry["content"].as_str().unwrap_or("");
+                    let _ = memory_db::upsert_tier(&state.db, &row.id, tier, content).await;
+                }
+            }
+            // Bind to task if task_id provided
+            if let Some(task_id) = data["task_id"].as_str().filter(|s| !s.is_empty()) {
+                let _ = memory_db::bind_task_memory(&state.db, task_id, &row.id).await;
+            }
+
+            info!(memory_id = %row.id, scope = %scope, category = %category, "memory stored");
+            let _ = ack.send(&serde_json::json!({ "success": true, "memory_id": row.id }));
+
+            let broadcast = serde_json::json!({ "action": "created", "memory_id": row.id });
+            let _ = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::MEMORY_CHANGED, &broadcast);
+            let _ = socket.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+            );
+        }
+        Err(e) => {
+            warn!(err = %e, "failed to store memory");
+            ack_error(ack, "internal server error");
+        }
+    }
+}
+
+async fn on_memory_query(data: serde_json::Value, ack: AckSender, state: Arc<KingState>) {
+    let query = data["query"].as_str().unwrap_or("");
+    let limit = data["limit"].as_u64().unwrap_or(20).min(MAX_TASK_LIMIT) as u32;
+    let scope = data["scope"].as_str();
+    let category = data["category"].as_str();
+    let agent_id = data["agent_id"].as_str();
+    let tier = data["tier"].as_str();
+
+    match memory_db::search_memories(&state.db, query, limit, scope, category, agent_id, tier).await
+    {
+        Ok(rows) => {
+            // Touch each result to increment access count
+            for row in &rows {
+                let _ = memory_db::touch_memory(&state.db, &row.id).await;
+            }
+
+            // Build response including tiers for each memory
+            let mut memories = Vec::new();
+            for row in &rows {
+                let tiers = memory_db::get_tiers(&state.db, &row.id)
+                    .await
+                    .unwrap_or_default();
+                let mut mem = memory_row_to_json(row);
+                mem["tiers"] = tiers
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id,
+                            "tier": t.tier,
+                            "content": t.content,
+                            "created_at": t.created_at,
+                            "updated_at": t.updated_at,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                memories.push(mem);
+            }
+
+            let count = memories.len();
+            let _ = ack.send(&serde_json::json!({
+                "success": true,
+                "memories": memories,
+                "count": count,
+            }));
+        }
+        Err(e) => {
+            warn!(err = %e, "failed to query memories");
+            ack_error(ack, "internal server error");
+        }
+    }
+}
+
+fn memory_row_to_json(row: &memory_db::MemoryRow) -> serde_json::Value {
+    let metadata = serde_json::from_str::<serde_json::Value>(&row.metadata)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let tags: Vec<&str> = if row.tags.is_empty() {
+        vec![]
+    } else {
+        row.tags.split(',').collect()
+    };
+
+    serde_json::json!({
+        "id":              row.id,
+        "scope":           row.scope,
+        "category":        row.category,
+        "key":             row.key,
+        "metadata":        metadata,
+        "tags":            tags,
+        "agent_id":        row.agent_id,
+        "run_id":          row.run_id,
+        "skill_id":        row.skill_id,
+        "relevance_score": row.relevance_score,
+        "access_count":    row.access_count,
+        "created_at":      row.created_at,
+        "updated_at":      row.updated_at,
+    })
+}
+
+async fn on_memory_update(
+    socket: SocketRef,
+    data: serde_json::Value,
+    ack: AckSender,
+    state: Arc<KingState>,
+) {
+    let memory_id = match data["memory_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            ack_error(ack, "missing memory_id");
+            return;
+        }
+    };
+
+    let metadata = data.get("metadata").map(|v| v.to_string());
+    let tags = match data.get("tags") {
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        _ => None,
+    };
+    let relevance_score = data["relevance_score"].as_f64();
+
+    match memory_db::update_memory(
+        &state.db,
+        memory_id,
+        metadata.as_deref(),
+        tags.as_deref(),
+        relevance_score,
+    )
+    .await
+    {
+        Ok(Some(row)) => {
+            // Upsert tiers if provided
+            if let Some(serde_json::Value::Array(tiers)) = data.get("tiers") {
+                for tier_entry in tiers {
+                    let tier = tier_entry["tier"].as_str().unwrap_or("l0");
+                    let content = tier_entry["content"].as_str().unwrap_or("");
+                    let _ = memory_db::upsert_tier(&state.db, &row.id, tier, content).await;
+                }
+            }
+
+            info!(memory_id = %memory_id, "memory updated");
+            let _ = ack
+                .send(&serde_json::json!({ "success": true, "memory": memory_row_to_json(&row) }));
+
+            let broadcast = serde_json::json!({ "action": "updated", "memory_id": memory_id });
+            let _ = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::MEMORY_CHANGED, &broadcast);
+            let _ = socket.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+            );
+        }
+        Ok(None) => {
+            ack_error(ack, &format!("memory not found: {memory_id}"));
+        }
+        Err(e) => {
+            warn!(err = %e, "failed to update memory");
+            ack_error(ack, "internal server error");
+        }
+    }
+}
+
+async fn on_memory_delete(
+    socket: SocketRef,
+    data: serde_json::Value,
+    ack: AckSender,
+    state: Arc<KingState>,
+) {
+    let memory_id = match data["memory_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            ack_error(ack, "missing memory_id");
+            return;
+        }
+    };
+
+    match memory_db::delete_memory(&state.db, memory_id).await {
+        Ok(true) => {
+            info!(memory_id = %memory_id, "memory deleted");
+            let _ = ack.send(&serde_json::json!({ "success": true, "memory_id": memory_id }));
+
+            let broadcast = serde_json::json!({ "action": "deleted", "memory_id": memory_id });
+            let _ = socket
+                .to(events::ROOM_KERNEL)
+                .emit(events::MEMORY_CHANGED, &broadcast);
+            let _ = socket.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+            );
+        }
+        Ok(false) => {
+            ack_error(ack, &format!("memory not found: {memory_id}"));
+        }
+        Err(e) => {
+            warn!(err = %e, "failed to delete memory");
             ack_error(ack, "internal server error");
         }
     }
