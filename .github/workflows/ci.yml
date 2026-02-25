@@ -16,17 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # evo-common is a sibling path dependency: ../evo-common
+      # Check it out next to evo-king so Cargo can resolve the path dep.
+      - name: Checkout evo-common
+        uses: actions/checkout@v4
+        with:
+          repository: ai-evo-agents/evo-common
+          path: ../evo-common
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Use crates.io dependencies
-        shell: bash
-        run: |
-          sed -i.bak 's|evo-common.*=.*{.*path.*=.*"[^"]*".*}|evo-common = "0.6"|' Cargo.toml
-          rm -f Cargo.toml.bak
 
       - name: cargo fmt --check
         run: cargo fmt --check
