@@ -22,6 +22,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Use crates.io dependencies
+        shell: bash
+        run: |
+          sed -i.bak 's|evo-common.*=.*{.*path.*=.*"[^"]*".*}|evo-common = "0.6"|' Cargo.toml
+          rm -f Cargo.toml.bak
+
       - name: cargo fmt --check
         run: cargo fmt --check
 
