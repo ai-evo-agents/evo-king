@@ -11,7 +11,11 @@ mod task_db;
 
 use agent_manager::AgentRegistry;
 use anyhow::{Context, Result};
-use axum::{Json, Router, extract::{Query, State}, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::{get, post},
+};
 use clap::{Parser, Subcommand};
 use evo_common::logging::init_logging;
 use pipeline_coordinator::PipelineCoordinator;
@@ -77,8 +81,8 @@ async fn main() -> Result<()> {
     let gateway_config_path =
         std::env::var("GATEWAY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_GATEWAY_CONFIG.to_string());
 
-    let kernel_agents_dir =
-        std::env::var("KERNEL_AGENTS_DIR").unwrap_or_else(|_| DEFAULT_KERNEL_AGENTS_DIR.to_string());
+    let kernel_agents_dir = std::env::var("KERNEL_AGENTS_DIR")
+        .unwrap_or_else(|_| DEFAULT_KERNEL_AGENTS_DIR.to_string());
 
     let runner_binary =
         std::env::var("RUNNER_BINARY").unwrap_or_else(|_| DEFAULT_RUNNER_BINARY.to_string());
@@ -106,10 +110,7 @@ async fn main() -> Result<()> {
     let agent_registry = Arc::new(AgentRegistry::new());
     let db_arc = Arc::new(db);
 
-    let pipeline_coordinator = Arc::new(PipelineCoordinator::new(
-        Arc::clone(&db_arc),
-        io.clone(),
-    ));
+    let pipeline_coordinator = Arc::new(PipelineCoordinator::new(Arc::clone(&db_arc), io.clone()));
 
     let state = Arc::new(KingState {
         db: db_arc,
@@ -148,7 +149,10 @@ async fn main() -> Result<()> {
         .route("/pipeline/runs", get(pipeline_list_handler))
         .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
         // ── Dashboard API endpoints ──────────────────────────────────────────
-        .route("/gateway/config", get(gateway_config_get_handler).put(gateway_config_put_handler))
+        .route(
+            "/gateway/config",
+            get(gateway_config_get_handler).put(gateway_config_put_handler),
+        )
         .route("/config-history", get(config_history_handler))
         .route("/tasks", get(tasks_list_handler))
         .route("/task/current", get(task_current_handler))
@@ -183,13 +187,9 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             // Small delay to ensure server is fully accepting connections
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let spawned = agent_manager::spawn_all_kernel_agents(
-                &registry,
-                &root,
-                &binary,
-                &king_address,
-            )
-            .await;
+            let spawned =
+                agent_manager::spawn_all_kernel_agents(&registry, &root, &binary, &king_address)
+                    .await;
             info!(count = spawned.len(), agents = ?spawned, "kernel agents spawned");
         });
     }
@@ -295,10 +295,7 @@ async fn pipeline_start_handler(
 async fn pipeline_list_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
     match state.pipeline_coordinator.list_runs(100, None).await {
         Ok(rows) => {
-            let runs: Vec<serde_json::Value> = rows
-                .iter()
-                .map(pipeline_row_to_json)
-                .collect();
+            let runs: Vec<serde_json::Value> = rows.iter().map(pipeline_row_to_json).collect();
             let count = runs.len();
             Json(json!({ "runs": runs, "count": count }))
         }
@@ -313,10 +310,7 @@ async fn pipeline_detail_handler(
 ) -> Json<serde_json::Value> {
     match state.pipeline_coordinator.get_run_stages(&run_id).await {
         Ok(stages) => {
-            let list: Vec<serde_json::Value> = stages
-                .iter()
-                .map(pipeline_row_to_json)
-                .collect();
+            let list: Vec<serde_json::Value> = stages.iter().map(pipeline_row_to_json).collect();
             let count = list.len();
             Json(json!({ "run_id": run_id, "stages": list, "count": count }))
         }
@@ -352,18 +346,16 @@ fn pipeline_row_to_json(row: &task_db::PipelineRow) -> serde_json::Value {
 /// Broadcasts `king:config_update` to all connected agents, prompting them to
 /// re-validate their gateway config.  Called by the update agent after it has
 /// committed new dependency versions.
-async fn admin_config_sync_handler(
-    State(state): State<Arc<KingState>>,
-) -> Json<serde_json::Value> {
+async fn admin_config_sync_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
     let payload = json!({
         "trigger": "config_sync",
         "reason": "post_dependency_update",
     });
 
-    match state.io.emit(
-        evo_common::messages::events::KING_CONFIG_UPDATE,
-        &payload,
-    ) {
+    match state
+        .io
+        .emit(evo_common::messages::events::KING_CONFIG_UPDATE, &payload)
+    {
         Ok(_) => {
             info!("config-sync broadcast sent to all agents");
             Json(json!({ "success": true }))
@@ -376,9 +368,7 @@ async fn admin_config_sync_handler(
 }
 
 /// GET /admin/crons — list all cron jobs and their last run status.
-async fn admin_list_crons_handler(
-    State(state): State<Arc<KingState>>,
-) -> Json<serde_json::Value> {
+async fn admin_list_crons_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
     match task_db::list_cron_jobs(&state.db).await {
         Ok(jobs) => {
             let list: Vec<serde_json::Value> = jobs
@@ -457,7 +447,9 @@ async fn gateway_config_put_handler(
     // Pretty-print for readability
     let pretty = match serde_json::to_string_pretty(&body) {
         Ok(s) => s,
-        Err(e) => return Json(json!({ "success": false, "error": format!("serialize error: {e}") })),
+        Err(e) => {
+            return Json(json!({ "success": false, "error": format!("serialize error: {e}") }));
+        }
     };
 
     let path = &state.gateway_config_path;
@@ -471,9 +463,7 @@ async fn gateway_config_put_handler(
 }
 
 /// GET /config-history — list gateway config change history.
-async fn config_history_handler(
-    State(state): State<Arc<KingState>>,
-) -> Json<serde_json::Value> {
+async fn config_history_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
     match task_db::list_config_history(&state.db, 100).await {
         Ok(history) => {
             let list: Vec<serde_json::Value> = history
@@ -550,10 +540,11 @@ async fn debug_prompt_handler(
         "sending debug prompt to agent"
     );
 
-    match state.io.to(room).emit(
-        evo_common::messages::events::DEBUG_PROMPT,
-        &payload,
-    ) {
+    match state
+        .io
+        .to(room)
+        .emit(evo_common::messages::events::DEBUG_PROMPT, &payload)
+    {
         Ok(_) => Json(json!({ "success": true, "request_id": request_id })),
         Err(e) => {
             tracing::error!(err = %e, "failed to emit debug:prompt");
@@ -564,8 +555,7 @@ async fn debug_prompt_handler(
 
 /// Convert a TaskRow to JSON for HTTP responses.
 fn task_row_to_json_http(r: &task_db::TaskRow) -> serde_json::Value {
-    let payload = serde_json::from_str::<serde_json::Value>(&r.payload)
-        .unwrap_or(json!({}));
+    let payload = serde_json::from_str::<serde_json::Value>(&r.payload).unwrap_or(json!({}));
     json!({
         "id":            r.id,
         "task_type":     r.task_type,
@@ -604,9 +594,7 @@ async fn tasks_list_handler(
 }
 
 /// GET /task/current — get the current (running or most recent) task.
-async fn task_current_handler(
-    State(state): State<Arc<KingState>>,
-) -> Json<serde_json::Value> {
+async fn task_current_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
     match task_db::get_current_task(&state.db).await {
         Ok(Some(task)) => Json(json!({ "task": task_row_to_json_http(&task) })),
         Ok(None) => Json(json!({ "task": null })),
@@ -630,7 +618,9 @@ async fn task_logs_handler(
     let limit = params.limit.unwrap_or(100).min(500);
     let offset = params.offset.unwrap_or(0);
 
-    let count = task_db::count_task_logs(&state.db, &task_id).await.unwrap_or(0);
+    let count = task_db::count_task_logs(&state.db, &task_id)
+        .await
+        .unwrap_or(0);
 
     match task_db::list_task_logs(&state.db, &task_id, limit, offset).await {
         Ok(logs) => {

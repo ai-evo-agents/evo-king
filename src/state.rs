@@ -14,6 +14,7 @@ pub struct KingState {
     /// Socket.IO handle — used to broadcast events to all connected runners.
     pub io: SocketIo,
     /// HTTP client for probing gateway health.
+    #[allow(dead_code)]
     pub http_client: Arc<Client>,
     /// Filesystem path to gateway.json (watched for changes).
     pub gateway_config_path: String,

@@ -21,8 +21,16 @@ pub mod names {
 /// (name, schedule_str, poll_interval) — schedule_str is stored in the DB,
 /// poll_interval is the actual `Duration` used by the polling loop.
 const SYSTEM_CRONS: &[(&str, &str, Duration)] = &[
-    (names::DAILY_UPDATE_CHECK, "0 0 * * *", Duration::from_secs(24 * 60 * 60)),
-    (names::GATEWAY_HEALTH_CHECK, "0 * * * *", Duration::from_secs(60 * 60)),
+    (
+        names::DAILY_UPDATE_CHECK,
+        "0 0 * * *",
+        Duration::from_secs(24 * 60 * 60),
+    ),
+    (
+        names::GATEWAY_HEALTH_CHECK,
+        "0 * * * *",
+        Duration::from_secs(60 * 60),
+    ),
 ];
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -78,7 +86,11 @@ async fn cron_loop(name: &'static str, interval: Duration, db: Arc<Database>, io
             }
         };
 
-        let enabled = jobs.iter().find(|j| j.name == name).map(|j| j.enabled).unwrap_or(false);
+        let enabled = jobs
+            .iter()
+            .find(|j| j.name == name)
+            .map(|j| j.enabled)
+            .unwrap_or(false);
 
         if !enabled {
             info!(name = %name, "cron job disabled — skipping");
@@ -95,14 +107,7 @@ async fn cron_loop(name: &'static str, interval: Duration, db: Arc<Database>, io
             }
         };
 
-        if let Err(e) = task_db::update_cron_run(
-            &db,
-            name,
-            status,
-            err_msg.as_deref(),
-            None,
-        )
-        .await
+        if let Err(e) = task_db::update_cron_run(&db, name, status, err_msg.as_deref(), None).await
         {
             error!(name = %name, error = %e, "cron: failed to record run result");
         }

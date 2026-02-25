@@ -20,6 +20,7 @@ struct CheckResult {
     name: String,
     passed: bool,
     message: String,
+    #[allow(dead_code)]
     fixable: bool,
 }
 
@@ -149,10 +150,10 @@ pub async fn run_doctor(evo_home: &str, fix: bool) -> Result<()> {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn shellexpand(s: &str) -> String {
-    if s.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}{}", &s[1..]);
-        }
+    if s.starts_with("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}{}", &s[1..]);
     }
     s.to_string()
 }
@@ -171,7 +172,11 @@ fn check_dir(path: &Path, fix: bool, results: &mut Vec<CheckResult>) {
         results.push(CheckResult {
             name,
             passed: ok,
-            message: if ok { "created".into() } else { "failed to create".into() },
+            message: if ok {
+                "created".into()
+            } else {
+                "failed to create".into()
+            },
             fixable: true,
         });
     } else {

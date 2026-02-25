@@ -2,10 +2,6 @@ use anyhow::{Context, Result};
 use libsql::{Builder, Connection, Database};
 use tracing::{info, warn};
 
-// serde_json is a workspace dep; used for diagnostic JSON in mark_agent_failed_by_role
-#[allow(unused_imports)]
-use serde_json;
-
 // ─── Connection helper ────────────────────────────────────────────────────────
 
 /// Create a libSQL connection and immediately set `busy_timeout=5000`.
@@ -38,11 +34,9 @@ pub async fn init_db(path: &str) -> Result<Database> {
     // Set a 5-second busy timeout so concurrent writers retry instead of
     // immediately returning SQLITE_BUSY (which caused 4/6 agent:register
     // upserts to fail when all agents connect simultaneously).
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-    )
-    .await
-    .context("Failed to set WAL + busy_timeout pragmas")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+        .await
+        .context("Failed to set WAL + busy_timeout pragmas")?;
 
     // Tasks table — generic work units
     conn.execute(
@@ -377,6 +371,7 @@ fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
 /// `run_id` links the task to a pipeline run (1:1).
 /// `current_stage` is the initial pipeline stage (e.g. "learning").
 /// `summary` is a human-readable description of the current activity.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_task(
     db: &Database,
     task_type: &str,
@@ -561,7 +556,10 @@ pub async fn get_current_task(db: &Database) -> Result<Option<TaskRow>> {
         "SELECT {} FROM tasks WHERE status = 'running' ORDER BY created_at DESC LIMIT 1",
         TASK_COLS
     );
-    let mut rows = conn.query(&sql, ()).await.context("get current running task")?;
+    let mut rows = conn
+        .query(&sql, ())
+        .await
+        .context("get current running task")?;
     if let Some(row) = rows.next().await.context("read row")? {
         return Ok(Some(row_to_task(&row)?));
     }
@@ -826,6 +824,7 @@ pub async fn get_pipeline_run_stages(db: &Database, run_id: &str) -> Result<Vec<
 }
 
 /// Get the most recent stage for each active (running) pipeline run.
+#[allow(dead_code)]
 pub async fn get_active_pipeline_runs(db: &Database) -> Result<Vec<PipelineRow>> {
     let conn = db_connect(db).await?;
 
@@ -1039,7 +1038,10 @@ pub async fn list_pipeline_runs(
         param_values.len()
     ));
 
-    let mut rows = conn.query(&sql, param_values).await.context("list pipeline runs")?;
+    let mut rows = conn
+        .query(&sql, param_values)
+        .await
+        .context("list pipeline runs")?;
     let mut runs = Vec::new();
 
     while let Some(row) = rows.next().await.context("read pipeline row")? {

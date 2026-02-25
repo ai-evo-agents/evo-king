@@ -90,13 +90,17 @@ impl PipelineCoordinator {
         });
 
         let room = stage_to_room(&first_stage);
-        if let Err(e) = self.io.to(room.clone()).emit(events::PIPELINE_NEXT, &payload) {
+        if let Err(e) = self
+            .io
+            .to(room.clone())
+            .emit(events::PIPELINE_NEXT, &payload)
+        {
             error!(run_id = %run_id, room = %room, err = %e, "failed to emit pipeline:next");
         }
         // Notify dashboard clients
         let _ = self.io.to("dashboard").emit(
             "dashboard:event",
-            &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+            serde_json::json!({ "event": "pipeline:next", "data": payload }),
         );
 
         Ok(run_id)
@@ -104,6 +108,7 @@ impl PipelineCoordinator {
 
     /// Handle a stage result reported by an agent. Advances the pipeline to the
     /// next stage, or marks the run as completed/failed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn on_stage_result(
         &self,
         run_id: &str,
@@ -158,7 +163,10 @@ impl PipelineCoordinator {
         );
 
         // Look up the task linked to this run
-        let task = task_db::get_task_by_run_id(&self.db, run_id).await.ok().flatten();
+        let task = task_db::get_task_by_run_id(&self.db, run_id)
+            .await
+            .ok()
+            .flatten();
 
         // If failed, the pipeline run stops here
         if status == "failed" {
@@ -173,20 +181,34 @@ impl PipelineCoordinator {
             if let Some(ref t) = task {
                 let fail_summary = format!("Failed at {} — {}", stage_str, err_text);
                 let _ = task_db::update_task(
-                    &self.db, &t.id,
-                    Some("failed"), None, None,
-                    None, Some(&fail_summary),
-                ).await;
+                    &self.db,
+                    &t.id,
+                    Some("failed"),
+                    None,
+                    None,
+                    None,
+                    Some(&fail_summary),
+                )
+                .await;
                 let log = task_db::create_task_log(
-                    &self.db, &t.id, "error",
+                    &self.db,
+                    &t.id,
+                    "error",
                     &format!("Stage {} failed: {}", stage_str, err_text),
-                    &output.to_string(), agent_id, stage_str,
-                ).await;
+                    &output.to_string(),
+                    agent_id,
+                    stage_str,
+                )
+                .await;
                 // Broadcast updates
-                if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
-                    if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                    && let Some(ref ut) = updated
+                {
+                    self.broadcast_task_changed(ut);
                 }
-                if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                if let Ok(ref l) = log {
+                    self.broadcast_task_log(&t.id, l);
+                }
             }
             return Ok(());
         }
@@ -196,11 +218,18 @@ impl PipelineCoordinator {
             // Log stage completion
             if let Some(ref t) = task {
                 let log = task_db::create_task_log(
-                    &self.db, &t.id, "info",
+                    &self.db,
+                    &t.id,
+                    "info",
                     &format!("Stage {} completed", stage_str),
-                    &output.to_string(), agent_id, stage_str,
-                ).await;
-                if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                    &output.to_string(),
+                    agent_id,
+                    stage_str,
+                )
+                .await;
+                if let Ok(ref l) = log {
+                    self.broadcast_task_log(&t.id, l);
+                }
             }
 
             match next_stage(stage) {
@@ -216,20 +245,34 @@ impl PipelineCoordinator {
                     if let Some(ref t) = task {
                         let next_summary = format!("{} — {}", next_str, stage_summary(next_str));
                         let _ = task_db::update_task(
-                            &self.db, &t.id,
-                            None, None, None,
-                            Some(next_str), Some(&next_summary),
-                        ).await;
+                            &self.db,
+                            &t.id,
+                            None,
+                            None,
+                            None,
+                            Some(next_str),
+                            Some(&next_summary),
+                        )
+                        .await;
                         let log = task_db::create_task_log(
-                            &self.db, &t.id, "info",
+                            &self.db,
+                            &t.id,
+                            "info",
                             &format!("Stage {} started", next_str),
-                            "", "", next_str,
-                        ).await;
+                            "",
+                            "",
+                            next_str,
+                        )
+                        .await;
                         // Broadcast updates
-                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
-                            if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                            && let Some(ref ut) = updated
+                        {
+                            self.broadcast_task_changed(ut);
                         }
-                        if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                        if let Ok(ref l) = log {
+                            self.broadcast_task_log(&t.id, l);
+                        }
                     }
 
                     // Emit pipeline:next to the next role room
@@ -241,7 +284,11 @@ impl PipelineCoordinator {
                     });
 
                     let room = stage_to_room(&next);
-                    if let Err(e) = self.io.to(room.clone()).emit(events::PIPELINE_NEXT, &payload) {
+                    if let Err(e) = self
+                        .io
+                        .to(room.clone())
+                        .emit(events::PIPELINE_NEXT, &payload)
+                    {
                         error!(
                             run_id = %run_id,
                             next_stage = %next_str,
@@ -253,7 +300,7 @@ impl PipelineCoordinator {
                     // Notify dashboard clients
                     let _ = self.io.to("dashboard").emit(
                         "dashboard:event",
-                        &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+                        serde_json::json!({ "event": "pipeline:next", "data": payload }),
                     );
 
                     info!(
@@ -273,19 +320,33 @@ impl PipelineCoordinator {
                     // Mark task as completed
                     if let Some(ref t) = task {
                         let _ = task_db::update_task(
-                            &self.db, &t.id,
-                            Some("completed"), None, None,
-                            None, Some("Pipeline completed successfully"),
-                        ).await;
+                            &self.db,
+                            &t.id,
+                            Some("completed"),
+                            None,
+                            None,
+                            None,
+                            Some("Pipeline completed successfully"),
+                        )
+                        .await;
                         let log = task_db::create_task_log(
-                            &self.db, &t.id, "info",
+                            &self.db,
+                            &t.id,
+                            "info",
                             "Pipeline completed successfully",
-                            "", agent_id, stage_str,
-                        ).await;
-                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
-                            if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                            "",
+                            agent_id,
+                            stage_str,
+                        )
+                        .await;
+                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                            && let Some(ref ut) = updated
+                        {
+                            self.broadcast_task_changed(ut);
                         }
-                        if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                        if let Ok(ref l) = log {
+                            self.broadcast_task_log(&t.id, l);
+                        }
                     }
 
                     // Check if this was a self-upgrade pipeline that was approved
@@ -310,9 +371,7 @@ impl PipelineCoordinator {
                         );
 
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                trigger_update(&component, &new_version, &rid).await
-                            {
+                            if let Err(e) = trigger_update(&component, &new_version, &rid).await {
                                 error!(
                                     run_id = %rid,
                                     component = %component,
@@ -362,22 +421,41 @@ impl PipelineCoordinator {
                         }
 
                         // Update the linked task as failed + log the timeout
-                        if let Ok(Some(task)) = task_db::get_task_by_run_id(&self.db, &stage.run_id).await {
+                        if let Ok(Some(task)) =
+                            task_db::get_task_by_run_id(&self.db, &stage.run_id).await
+                        {
                             let timeout_summary = format!("Timed out at {}", stage.stage);
                             let _ = task_db::update_task(
-                                &self.db, &task.id,
-                                Some("failed"), None, None,
-                                None, Some(&timeout_summary),
-                            ).await;
+                                &self.db,
+                                &task.id,
+                                Some("failed"),
+                                None,
+                                None,
+                                None,
+                                Some(&timeout_summary),
+                            )
+                            .await;
                             let log = task_db::create_task_log(
-                                &self.db, &task.id, "warn",
-                                &format!("Stage {} timed out after {}s", stage.stage, DEFAULT_STAGE_TIMEOUT_SECS),
-                                "", &stage.agent_id, &stage.stage,
-                            ).await;
-                            if let Ok(updated) = task_db::get_task(&self.db, &task.id).await {
-                                if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                                &self.db,
+                                &task.id,
+                                "warn",
+                                &format!(
+                                    "Stage {} timed out after {}s",
+                                    stage.stage, DEFAULT_STAGE_TIMEOUT_SECS
+                                ),
+                                "",
+                                &stage.agent_id,
+                                &stage.stage,
+                            )
+                            .await;
+                            if let Ok(updated) = task_db::get_task(&self.db, &task.id).await
+                                && let Some(ref ut) = updated
+                            {
+                                self.broadcast_task_changed(ut);
                             }
-                            if let Ok(ref l) = log { self.broadcast_task_log(&task.id, l); }
+                            if let Ok(ref l) = log {
+                                self.broadcast_task_log(&task.id, l);
+                            }
                         }
                     }
                 }
@@ -488,10 +566,10 @@ fn stage_summary(stage: &str) -> &'static str {
 /// Resolve the EVO_HOME directory (~/.evo-agents).
 fn evo_home() -> PathBuf {
     let raw = std::env::var("EVO_HOME").unwrap_or_else(|_| "~/.evo-agents".to_string());
-    if raw.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(format!("{home}{}", &raw[1..]));
-        }
+    if raw.starts_with("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(format!("{home}{}", &raw[1..]));
     }
     PathBuf::from(raw)
 }

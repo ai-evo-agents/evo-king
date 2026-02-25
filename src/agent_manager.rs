@@ -1,6 +1,11 @@
 use anyhow::{Context, Result};
 use libsql::Database;
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -166,7 +171,9 @@ pub async fn spawn_runner(
         .arg(agent_folder)
         .env("KING_ADDRESS", king_address)
         .spawn()
-        .with_context(|| format!("Failed to spawn runner '{runner_binary}' for '{agent_folder}'"))?;
+        .with_context(|| {
+            format!("Failed to spawn runner '{runner_binary}' for '{agent_folder}'")
+        })?;
 
     Ok(child)
 }
@@ -416,7 +423,8 @@ pub async fn heartbeat_watch_loop(
                 }
                 Some(agent) => {
                     // Check if heartbeat is stale
-                    let last_hb = match chrono::DateTime::parse_from_rfc3339(&agent.last_heartbeat) {
+                    let last_hb = match chrono::DateTime::parse_from_rfc3339(&agent.last_heartbeat)
+                    {
                         Ok(ts) => ts.with_timezone(&chrono::Utc),
                         Err(_) => {
                             warn!(role = %role, heartbeat = %agent.last_heartbeat, "cannot parse heartbeat timestamp");

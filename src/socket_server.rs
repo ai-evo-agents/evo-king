@@ -107,7 +107,7 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                     );
                     let _ = state.io.to("dashboard").emit(
                         "dashboard:event",
-                        &serde_json::json!({ "event": "debug:response", "data": data }),
+                        serde_json::json!({ "event": "debug:response", "data": data }),
                     );
                 }
             },
@@ -212,11 +212,7 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         let _ = socket.join(events::ROOM_KERNEL);
 
         // Also join role-specific room for targeted pipeline:next dispatch
-        let role_room = format!(
-            "{}{}",
-            events::ROOM_ROLE_PREFIX,
-            role_str.replace('-', "_")
-        );
+        let role_room = format!("{}{}", events::ROOM_ROLE_PREFIX, role_str.replace('-', "_"));
         let _ = socket.join(role_room.clone());
         info!(
             role = %role_str,
@@ -250,7 +246,7 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
     // Notify dashboard clients
     let _ = state.io.to("dashboard").emit(
         "dashboard:event",
-        &serde_json::json!({ "event": "agent:register", "data": data }),
+        serde_json::json!({ "event": "agent:register", "data": data }),
     );
 }
 
@@ -264,15 +260,14 @@ async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
     };
     let status = data["status"].as_str().unwrap_or("heartbeat");
 
-    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, "", status, None, None, None).await
-    {
+    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, "", status, None, None, None).await {
         warn!(err = %e, "failed to update agent heartbeat in DB");
     }
 
     // Notify dashboard clients
     let _ = state.io.to("dashboard").emit(
         "dashboard:event",
-        &serde_json::json!({ "event": "agent:status", "data": data }),
+        serde_json::json!({ "event": "agent:status", "data": data }),
     );
 }
 
@@ -282,8 +277,17 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
 
     info!(agent_id = %agent_id, skill_id = %skill_id, "skill report received");
 
-    if let Err(e) =
-        task_db::create_task(&state.db, "skill_report", "completed", Some(agent_id), &data.to_string(), "", "", "").await
+    if let Err(e) = task_db::create_task(
+        &state.db,
+        "skill_report",
+        "completed",
+        Some(agent_id),
+        &data.to_string(),
+        "",
+        "",
+        "",
+    )
+    .await
     {
         warn!(err = %e, "failed to persist skill report task");
     }
@@ -339,7 +343,10 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
     let agent_id = data["agent_id"].as_str().unwrap_or("unknown");
     let status = data["status"].as_str().unwrap_or("completed");
     let artifact_id = data["artifact_id"].as_str().unwrap_or("");
-    let output = data.get("output").cloned().unwrap_or(serde_json::Value::Null);
+    let output = data
+        .get("output")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let error_msg = data["error"].as_str();
 
     info!(
@@ -352,7 +359,15 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
 
     if let Err(e) = state
         .pipeline_coordinator
-        .on_stage_result(run_id, &stage, agent_id, status, artifact_id, &output, error_msg)
+        .on_stage_result(
+            run_id,
+            &stage,
+            agent_id,
+            status,
+            artifact_id,
+            &output,
+            error_msg,
+        )
         .await
     {
         warn!(err = %e, run_id = %run_id, "failed to process pipeline stage result");
@@ -361,7 +376,7 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
     // Notify dashboard clients
     let _ = state.io.to("dashboard").emit(
         "dashboard:event",
-        &serde_json::json!({ "event": "pipeline:stage_result", "data": data }),
+        serde_json::json!({ "event": "pipeline:stage_result", "data": data }),
     );
 }
 
@@ -413,7 +428,11 @@ async fn on_task_create(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".to_string());
 
-    match task_db::create_task(&state.db, task_type, "pending", agent_id, &payload, "", "", "").await {
+    match task_db::create_task(
+        &state.db, task_type, "pending", agent_id, &payload, "", "", "",
+    )
+    .await
+    {
         Ok(row) => {
             let response = task_row_to_json(&row);
             info!(task_id = %row.id, task_type = %task_type, "task created");
@@ -429,7 +448,9 @@ async fn on_task_create(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
-            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
+            let _ = socket
+                .to("dashboard")
+                .emit(events::TASK_CHANGED, &broadcast);
         }
         Err(e) => {
             warn!(err = %e, "failed to create task");
@@ -458,7 +479,17 @@ async fn on_task_update(
     let current_stage = data["current_stage"].as_str();
     let summary = data["summary"].as_str();
 
-    match task_db::update_task(&state.db, task_id, status, agent_id, payload.as_deref(), current_stage, summary).await {
+    match task_db::update_task(
+        &state.db,
+        task_id,
+        status,
+        agent_id,
+        payload.as_deref(),
+        current_stage,
+        summary,
+    )
+    .await
+    {
         Ok(Some(row)) => {
             let response = task_row_to_json(&row);
             info!(task_id = %task_id, "task updated");
@@ -474,7 +505,9 @@ async fn on_task_update(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
-            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
+            let _ = socket
+                .to("dashboard")
+                .emit(events::TASK_CHANGED, &broadcast);
         }
         Ok(None) => {
             ack_error(ack, &format!("task not found: {task_id}"));
@@ -558,7 +591,9 @@ async fn on_task_delete(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
-            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
+            let _ = socket
+                .to("dashboard")
+                .emit(events::TASK_CHANGED, &broadcast);
         }
         Ok(false) => {
             ack_error(ack, &format!("task not found: {task_id}"));
