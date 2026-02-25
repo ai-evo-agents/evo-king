@@ -29,7 +29,8 @@ impl PipelineCoordinator {
         Self { db, io }
     }
 
-    /// Start a new pipeline run. Creates a DB record for the `learning` stage
+    /// Start a new pipeline run. Creates a DB record for the `learning` stage,
+    /// creates a main task linked to this run, inserts the first task log,
     /// and emits `pipeline:next` to the `role:learning` room.
     pub async fn start_run(&self, trigger_metadata: Value) -> Result<String> {
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -37,7 +38,7 @@ impl PipelineCoordinator {
         let stage_str = stage_to_str(&first_stage);
 
         // Create the first stage record
-        let row = task_db::create_pipeline_stage(&self.db, &run_id, stage_str, "")
+        let _row = task_db::create_pipeline_stage(&self.db, &run_id, stage_str, "")
             .await
             .context("create initial pipeline stage")?;
 
@@ -46,6 +47,39 @@ impl PipelineCoordinator {
             stage = %stage_str,
             "pipeline run started"
         );
+
+        // Create the main task linked to this pipeline run
+        let summary = format!("{} — {}", stage_str, stage_summary(stage_str));
+        let task_row = task_db::create_task(
+            &self.db,
+            "pipeline",
+            "running",
+            None,
+            &serde_json::json!({ "trigger": trigger_metadata }).to_string(),
+            &run_id,
+            stage_str,
+            &summary,
+        )
+        .await
+        .context("create pipeline task")?;
+
+        // Insert the first task log
+        let log_row = task_db::create_task_log(
+            &self.db,
+            &task_row.id,
+            "info",
+            "Pipeline started",
+            &serde_json::json!({ "trigger": trigger_metadata }).to_string(),
+            "",
+            stage_str,
+        )
+        .await;
+
+        // Broadcast task:changed + task:log to dashboard
+        self.broadcast_task_changed(&task_row);
+        if let Ok(log) = &log_row {
+            self.broadcast_task_log(&task_row.id, log);
+        }
 
         // Emit pipeline:next to the role room for the first stage
         let payload = serde_json::json!({
@@ -59,20 +93,11 @@ impl PipelineCoordinator {
         if let Err(e) = self.io.to(room.clone()).emit(events::PIPELINE_NEXT, &payload) {
             error!(run_id = %run_id, room = %room, err = %e, "failed to emit pipeline:next");
         }
-
-        // Also log as a task for visibility
-        let _ = task_db::create_task(
-            &self.db,
-            "pipeline_run",
-            None,
-            &serde_json::json!({
-                "run_id": run_id,
-                "stage_id": row.id,
-                "trigger": trigger_metadata,
-            })
-            .to_string(),
-        )
-        .await;
+        // Notify dashboard clients
+        let _ = self.io.to("dashboard").emit(
+            "dashboard:event",
+            &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+        );
 
         Ok(run_id)
     }
@@ -132,19 +157,52 @@ impl PipelineCoordinator {
             "pipeline stage result recorded"
         );
 
+        // Look up the task linked to this run
+        let task = task_db::get_task_by_run_id(&self.db, run_id).await.ok().flatten();
+
         // If failed, the pipeline run stops here
         if status == "failed" {
+            let err_text = error_msg.unwrap_or("unknown error");
             warn!(
                 run_id = %run_id,
                 stage = %stage_str,
-                error = ?error_msg,
+                error = %err_text,
                 "pipeline run failed at stage"
             );
+
+            if let Some(ref t) = task {
+                let fail_summary = format!("Failed at {} — {}", stage_str, err_text);
+                let _ = task_db::update_task(
+                    &self.db, &t.id,
+                    Some("failed"), None, None,
+                    None, Some(&fail_summary),
+                ).await;
+                let log = task_db::create_task_log(
+                    &self.db, &t.id, "error",
+                    &format!("Stage {} failed: {}", stage_str, err_text),
+                    &output.to_string(), agent_id, stage_str,
+                ).await;
+                // Broadcast updates
+                if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
+                    if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                }
+                if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+            }
             return Ok(());
         }
 
         // If completed, advance to the next stage
         if status == "completed" {
+            // Log stage completion
+            if let Some(ref t) = task {
+                let log = task_db::create_task_log(
+                    &self.db, &t.id, "info",
+                    &format!("Stage {} completed", stage_str),
+                    &output.to_string(), agent_id, stage_str,
+                ).await;
+                if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+            }
+
             match next_stage(stage) {
                 Some(next) => {
                     let next_str = stage_to_str(&next);
@@ -153,6 +211,26 @@ impl PipelineCoordinator {
                     task_db::create_pipeline_stage(&self.db, run_id, next_str, artifact_id)
                         .await
                         .context("create next pipeline stage")?;
+
+                    // Update the task: advance stage + summary
+                    if let Some(ref t) = task {
+                        let next_summary = format!("{} — {}", next_str, stage_summary(next_str));
+                        let _ = task_db::update_task(
+                            &self.db, &t.id,
+                            None, None, None,
+                            Some(next_str), Some(&next_summary),
+                        ).await;
+                        let log = task_db::create_task_log(
+                            &self.db, &t.id, "info",
+                            &format!("Stage {} started", next_str),
+                            "", "", next_str,
+                        ).await;
+                        // Broadcast updates
+                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
+                            if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                        }
+                        if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                    }
 
                     // Emit pipeline:next to the next role room
                     let payload = serde_json::json!({
@@ -172,6 +250,11 @@ impl PipelineCoordinator {
                             "failed to emit pipeline:next for next stage"
                         );
                     }
+                    // Notify dashboard clients
+                    let _ = self.io.to("dashboard").emit(
+                        "dashboard:event",
+                        &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+                    );
 
                     info!(
                         run_id = %run_id,
@@ -186,6 +269,24 @@ impl PipelineCoordinator {
                         run_id = %run_id,
                         "pipeline run completed all stages"
                     );
+
+                    // Mark task as completed
+                    if let Some(ref t) = task {
+                        let _ = task_db::update_task(
+                            &self.db, &t.id,
+                            Some("completed"), None, None,
+                            None, Some("Pipeline completed successfully"),
+                        ).await;
+                        let log = task_db::create_task_log(
+                            &self.db, &t.id, "info",
+                            "Pipeline completed successfully",
+                            "", agent_id, stage_str,
+                        ).await;
+                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await {
+                            if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                        }
+                        if let Ok(ref l) = log { self.broadcast_task_log(&t.id, l); }
+                    }
 
                     // Check if this was a self-upgrade pipeline that was approved
                     if output["build_type"].as_str() == Some("self_upgrade")
@@ -259,6 +360,25 @@ impl PipelineCoordinator {
                         {
                             error!(err = %e, "failed to mark stage as timed_out");
                         }
+
+                        // Update the linked task as failed + log the timeout
+                        if let Ok(Some(task)) = task_db::get_task_by_run_id(&self.db, &stage.run_id).await {
+                            let timeout_summary = format!("Timed out at {}", stage.stage);
+                            let _ = task_db::update_task(
+                                &self.db, &task.id,
+                                Some("failed"), None, None,
+                                None, Some(&timeout_summary),
+                            ).await;
+                            let log = task_db::create_task_log(
+                                &self.db, &task.id, "warn",
+                                &format!("Stage {} timed out after {}s", stage.stage, DEFAULT_STAGE_TIMEOUT_SECS),
+                                "", &stage.agent_id, &stage.stage,
+                            ).await;
+                            if let Ok(updated) = task_db::get_task(&self.db, &task.id).await {
+                                if let Some(ref ut) = updated { self.broadcast_task_changed(ut); }
+                            }
+                            if let Ok(ref l) = log { self.broadcast_task_log(&task.id, l); }
+                        }
                     }
                 }
                 Err(e) => {
@@ -266,6 +386,45 @@ impl PipelineCoordinator {
                 }
             }
         }
+    }
+
+    // ── Broadcast helpers ─────────────────────────────────────────────────────
+
+    /// Broadcast a `task:changed` event to the dashboard room.
+    fn broadcast_task_changed(&self, task: &task_db::TaskRow) {
+        let payload = serde_json::json!({
+            "action": "updated",
+            "task": {
+                "id":            task.id,
+                "task_type":     task.task_type,
+                "status":        task.status,
+                "agent_id":      task.agent_id,
+                "run_id":        task.run_id,
+                "current_stage": task.current_stage,
+                "summary":       task.summary,
+                "payload":       task.payload,
+                "created_at":    task.created_at,
+                "updated_at":    task.updated_at,
+            },
+        });
+        let _ = self.io.to("dashboard").emit("task:changed", &payload);
+    }
+
+    /// Broadcast a `task:log` event to the dashboard room.
+    fn broadcast_task_log(&self, task_id: &str, log: &task_db::TaskLogRow) {
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "log": {
+                "id":         log.id,
+                "level":      log.level,
+                "message":    log.message,
+                "detail":     log.detail,
+                "agent_id":   log.agent_id,
+                "stage":      log.stage,
+                "created_at": log.created_at,
+            },
+        });
+        let _ = self.io.to("dashboard").emit("task:log", &payload);
     }
 
     /// List all pipeline runs for HTTP API.
@@ -309,6 +468,18 @@ fn stage_to_str(stage: &PipelineStage) -> &'static str {
         PipelineStage::PreLoad => "pre_load",
         PipelineStage::Evaluation => "evaluation",
         PipelineStage::SkillManage => "skill_manage",
+    }
+}
+
+/// Human-readable description for each pipeline stage (used in task summary).
+fn stage_summary(stage: &str) -> &'static str {
+    match stage {
+        "learning" => "Discovering skills",
+        "building" => "Packaging skill",
+        "pre_load" => "Checking endpoints",
+        "evaluation" => "Evaluating quality",
+        "skill_manage" => "Managing activation",
+        _ => "Processing",
     }
 }
 

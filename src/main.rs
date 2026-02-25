@@ -11,14 +11,17 @@ mod task_db;
 
 use agent_manager::AgentRegistry;
 use anyhow::{Context, Result};
-use axum::{Json, Router, extract::State, routing::{get, post}};
+use axum::{Json, Router, extract::{Query, State}, routing::{get, post}};
 use clap::{Parser, Subcommand};
 use evo_common::logging::init_logging;
 use pipeline_coordinator::PipelineCoordinator;
+use serde::Deserialize;
 use serde_json::json;
 use socketioxide::SocketIo;
 use state::KingState;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tracing::info;
 
 const DEFAULT_PORT: u16 = 3000;
@@ -26,6 +29,7 @@ const DEFAULT_DB_PATH: &str = "king.db";
 const DEFAULT_GATEWAY_CONFIG: &str = "../evo-gateway/gateway.json";
 const DEFAULT_KERNEL_AGENTS_DIR: &str = "..";
 const DEFAULT_RUNNER_BINARY: &str = "../evo-agents/target/release/evo-runner";
+const DEFAULT_DASHBOARD_DIR: &str = "./dashboard";
 
 /// evo-king — central orchestrator for the evo multi-agent system.
 #[derive(Parser)]
@@ -78,6 +82,9 @@ async fn main() -> Result<()> {
 
     let runner_binary =
         std::env::var("RUNNER_BINARY").unwrap_or_else(|_| DEFAULT_RUNNER_BINARY.to_string());
+
+    let dashboard_dir =
+        std::env::var("EVO_DASHBOARD_DIR").unwrap_or_else(|_| DEFAULT_DASHBOARD_DIR.to_string());
 
     // ── Database ──────────────────────────────────────────────────────────────
     info!(db = %db_path, "initializing database");
@@ -140,11 +147,24 @@ async fn main() -> Result<()> {
         .route("/pipeline/start", post(pipeline_start_handler))
         .route("/pipeline/runs", get(pipeline_list_handler))
         .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
+        // ── Dashboard API endpoints ──────────────────────────────────────────
+        .route("/gateway/config", get(gateway_config_get_handler).put(gateway_config_put_handler))
+        .route("/config-history", get(config_history_handler))
+        .route("/tasks", get(tasks_list_handler))
+        .route("/task/current", get(task_current_handler))
+        .route("/task/{task_id}/logs", get(task_logs_handler))
+        // ── Debug endpoints ─────────────────────────────────────────────────
+        .route("/debug/prompt", post(debug_prompt_handler))
         // ── Admin endpoints ──────────────────────────────────────────────────
         .route("/admin/config-sync", post(admin_config_sync_handler))
         .route("/admin/crons", get(admin_list_crons_handler))
         .route("/admin/crons/{name}/run", post(admin_run_cron_handler))
+        // Static dashboard files as fallback (API routes take priority)
+        .fallback_service(ServeDir::new(&dashboard_dir).append_index_html_on_directories(true))
+        // Layers must come AFTER fallback so they wrap the entire router
+        // (socket_layer needs to intercept /socket.io/ before route matching)
         .layer(socket_layer)
+        .layer(CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
     let addr = format!("0.0.0.0:{port}");
@@ -400,5 +420,237 @@ async fn admin_run_cron_handler(
             tracing::warn!(cron = %name, err = %e, "manual cron trigger failed");
             Json(json!({ "success": false, "error": e.to_string() }))
         }
+    }
+}
+
+// ─── Dashboard API handlers ──────────────────────────────────────────────────
+
+/// GET /gateway/config — read current gateway configuration.
+async fn gateway_config_get_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    let path = &state.gateway_config_path;
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(config) => Json(config),
+            Err(e) => Json(json!({ "error": format!("invalid config JSON: {e}") })),
+        },
+        Err(e) => Json(json!({ "error": format!("cannot read {path}: {e}") })),
+    }
+}
+
+/// PUT /gateway/config — update gateway configuration.
+///
+/// Writes the validated config to the gateway config file. The existing
+/// config_watcher will detect the change and trigger the full lifecycle
+/// (backup, DB log, broadcast to agents).
+async fn gateway_config_put_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    // Validate by round-tripping through GatewayConfig
+    let json_str = body.to_string();
+    if let Err(e) = evo_common::config::GatewayConfig::from_json(&json_str) {
+        return Json(json!({ "success": false, "error": format!("invalid config: {e}") }));
+    }
+
+    // Pretty-print for readability
+    let pretty = match serde_json::to_string_pretty(&body) {
+        Ok(s) => s,
+        Err(e) => return Json(json!({ "success": false, "error": format!("serialize error: {e}") })),
+    };
+
+    let path = &state.gateway_config_path;
+    match std::fs::write(path, &pretty) {
+        Ok(()) => {
+            info!(path = %path, "gateway config updated via dashboard");
+            Json(json!({ "success": true }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": format!("write error: {e}") })),
+    }
+}
+
+/// GET /config-history — list gateway config change history.
+async fn config_history_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    match task_db::list_config_history(&state.db, 100).await {
+        Ok(history) => {
+            let list: Vec<serde_json::Value> = history
+                .iter()
+                .map(|h| {
+                    json!({
+                        "id":          h.id,
+                        "config_hash": h.config_hash,
+                        "action":      h.action,
+                        "backup_path": h.backup_path,
+                        "timestamp":   h.timestamp,
+                    })
+                })
+                .collect();
+            let count = list.len();
+            Json(json!({ "history": list, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Query parameters for GET /tasks.
+#[derive(Deserialize)]
+struct TasksQuery {
+    status: Option<String>,
+    agent_id: Option<String>,
+    limit: Option<u32>,
+}
+
+// ─── Debug HTTP handlers ────────────────────────────────────────────────────
+
+/// POST /debug/prompt — send a debug prompt to an agent role via gateway.
+///
+/// The agent processes the prompt through its gateway client and emits
+/// `debug:response` back via Socket.IO (relayed to dashboard).
+async fn debug_prompt_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let agent_role = match body["agent_role"].as_str() {
+        Some(r) if !r.is_empty() => r.to_string(),
+        _ => return Json(json!({ "success": false, "error": "agent_role is required" })),
+    };
+    let model = body["model"].as_str().unwrap_or("gpt-4o-mini").to_string();
+    let prompt = match body["prompt"].as_str() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return Json(json!({ "success": false, "error": "prompt is required" })),
+    };
+    let provider = body["provider"].as_str().map(|s| s.to_string());
+    let temperature = body["temperature"].as_f64();
+    let max_tokens = body["max_tokens"].as_u64();
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let room = format!(
+        "{}{}",
+        evo_common::messages::events::ROOM_ROLE_PREFIX,
+        agent_role.replace('-', "_")
+    );
+
+    let payload = json!({
+        "request_id": request_id,
+        "model": model,
+        "prompt": prompt,
+        "provider": provider,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    });
+
+    info!(
+        request_id = %request_id,
+        role = %agent_role,
+        model = %model,
+        room = %room,
+        "sending debug prompt to agent"
+    );
+
+    match state.io.to(room).emit(
+        evo_common::messages::events::DEBUG_PROMPT,
+        &payload,
+    ) {
+        Ok(_) => Json(json!({ "success": true, "request_id": request_id })),
+        Err(e) => {
+            tracing::error!(err = %e, "failed to emit debug:prompt");
+            Json(json!({ "success": false, "error": e.to_string() }))
+        }
+    }
+}
+
+/// Convert a TaskRow to JSON for HTTP responses.
+fn task_row_to_json_http(r: &task_db::TaskRow) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&r.payload)
+        .unwrap_or(json!({}));
+    json!({
+        "id":            r.id,
+        "task_type":     r.task_type,
+        "status":        r.status,
+        "agent_id":      r.agent_id,
+        "run_id":        r.run_id,
+        "current_stage": r.current_stage,
+        "summary":       r.summary,
+        "payload":       payload,
+        "created_at":    r.created_at,
+        "updated_at":    r.updated_at,
+    })
+}
+
+/// GET /tasks — list tasks with optional filters.
+async fn tasks_list_handler(
+    State(state): State<Arc<KingState>>,
+    Query(params): Query<TasksQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(50).min(500);
+    match task_db::list_tasks(
+        &state.db,
+        limit,
+        params.status.as_deref(),
+        params.agent_id.as_deref(),
+    )
+    .await
+    {
+        Ok(rows) => {
+            let tasks: Vec<serde_json::Value> = rows.iter().map(task_row_to_json_http).collect();
+            let count = tasks.len();
+            Json(json!({ "tasks": tasks, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /task/current — get the current (running or most recent) task.
+async fn task_current_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    match task_db::get_current_task(&state.db).await {
+        Ok(Some(task)) => Json(json!({ "task": task_row_to_json_http(&task) })),
+        Ok(None) => Json(json!({ "task": null })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Query parameters for GET /task/:id/logs.
+#[derive(Deserialize)]
+struct TaskLogsQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// GET /task/:task_id/logs — list log entries for a task (paginated).
+async fn task_logs_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Query(params): Query<TaskLogsQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(100).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    let count = task_db::count_task_logs(&state.db, &task_id).await.unwrap_or(0);
+
+    match task_db::list_task_logs(&state.db, &task_id, limit, offset).await {
+        Ok(logs) => {
+            let list: Vec<serde_json::Value> = logs
+                .iter()
+                .map(|l| {
+                    json!({
+                        "id":         l.id,
+                        "task_id":    l.task_id,
+                        "level":      l.level,
+                        "message":    l.message,
+                        "detail":     l.detail,
+                        "agent_id":   l.agent_id,
+                        "stage":      l.stage,
+                        "created_at": l.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "logs": list, "count": count }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }

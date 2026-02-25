@@ -26,12 +26,24 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         // Pipeline stage result handler arc
         let s_stage_result = Arc::clone(&state);
 
+        // Debug handler arc
+        let s_debug_response = Arc::clone(&state);
+
         // Task management handler arcs
         let s_task_create = Arc::clone(&state);
         let s_task_update = Arc::clone(&state);
         let s_task_get = Arc::clone(&state);
         let s_task_list = Arc::clone(&state);
         let s_task_delete = Arc::clone(&state);
+
+        // dashboard:subscribe — dashboard clients join a read-only room
+        socket.on(
+            "dashboard:subscribe",
+            move |s: SocketRef, _data: Data<serde_json::Value>| {
+                let _ = s.join("dashboard");
+                info!(sid = %s.id, "dashboard client subscribed");
+            },
+        );
 
         // agent:register — runner announces itself + its role
         socket.on(
@@ -75,6 +87,29 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             move |_s: SocketRef, Data::<serde_json::Value>(data)| {
                 let state = Arc::clone(&s_stage_result);
                 async move { on_pipeline_stage_result(data, state).await }
+            },
+        );
+
+        // ── Debug events ─────────────────────────────────────────────────────────
+
+        // debug:response — agent returns LLM response, relay to dashboard
+        socket.on(
+            events::DEBUG_RESPONSE,
+            move |_s: SocketRef, Data::<serde_json::Value>(data)| {
+                let state = Arc::clone(&s_debug_response);
+                async move {
+                    let request_id = data["request_id"].as_str().unwrap_or("unknown");
+                    let agent_id = data["agent_id"].as_str().unwrap_or("unknown");
+                    info!(
+                        request_id = %request_id,
+                        agent_id = %agent_id,
+                        "debug:response received, relaying to dashboard"
+                    );
+                    let _ = state.io.to("dashboard").emit(
+                        "dashboard:event",
+                        &serde_json::json!({ "event": "debug:response", "data": data }),
+                    );
+                }
             },
         );
 
@@ -211,6 +246,12 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
     {
         warn!(err = %e, "failed to record agent registration in DB");
     }
+
+    // Notify dashboard clients
+    let _ = state.io.to("dashboard").emit(
+        "dashboard:event",
+        &serde_json::json!({ "event": "agent:register", "data": data }),
+    );
 }
 
 async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
@@ -227,6 +268,12 @@ async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
     {
         warn!(err = %e, "failed to update agent heartbeat in DB");
     }
+
+    // Notify dashboard clients
+    let _ = state.io.to("dashboard").emit(
+        "dashboard:event",
+        &serde_json::json!({ "event": "agent:status", "data": data }),
+    );
 }
 
 async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
@@ -236,7 +283,7 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
     info!(agent_id = %agent_id, skill_id = %skill_id, "skill report received");
 
     if let Err(e) =
-        task_db::create_task(&state.db, "skill_report", Some(agent_id), &data.to_string()).await
+        task_db::create_task(&state.db, "skill_report", "completed", Some(agent_id), &data.to_string(), "", "", "").await
     {
         warn!(err = %e, "failed to persist skill report task");
     }
@@ -249,8 +296,12 @@ async fn on_health(data: serde_json::Value, state: Arc<KingState>) {
     if let Err(e) = task_db::create_task(
         &state.db,
         "health_report",
+        "completed",
         Some(agent_id),
         &data.to_string(),
+        "",
+        "",
+        "",
     )
     .await
     {
@@ -306,6 +357,12 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
     {
         warn!(err = %e, run_id = %run_id, "failed to process pipeline stage result");
     }
+
+    // Notify dashboard clients
+    let _ = state.io.to("dashboard").emit(
+        "dashboard:event",
+        &serde_json::json!({ "event": "pipeline:stage_result", "data": data }),
+    );
 }
 
 // ─── Task event handlers ─────────────────────────────────────────────────────
@@ -320,13 +377,16 @@ fn task_row_to_json(row: &task_db::TaskRow) -> serde_json::Value {
     };
 
     serde_json::json!({
-        "id":         row.id,
-        "task_type":  row.task_type,
-        "status":     row.status,
-        "agent_id":   row.agent_id,
-        "payload":    payload,
-        "created_at": row.created_at,
-        "updated_at": row.updated_at,
+        "id":            row.id,
+        "task_type":     row.task_type,
+        "status":        row.status,
+        "agent_id":      row.agent_id,
+        "run_id":        row.run_id,
+        "current_stage": row.current_stage,
+        "summary":       row.summary,
+        "payload":       payload,
+        "created_at":    row.created_at,
+        "updated_at":    row.updated_at,
     })
 }
 
@@ -353,7 +413,7 @@ async fn on_task_create(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".to_string());
 
-    match task_db::create_task(&state.db, task_type, agent_id, &payload).await {
+    match task_db::create_task(&state.db, task_type, "pending", agent_id, &payload, "", "", "").await {
         Ok(row) => {
             let response = task_row_to_json(&row);
             info!(task_id = %row.id, task_type = %task_type, "task created");
@@ -369,6 +429,7 @@ async fn on_task_create(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
+            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
         }
         Err(e) => {
             warn!(err = %e, "failed to create task");
@@ -394,8 +455,10 @@ async fn on_task_update(
     let status = data["status"].as_str();
     let agent_id = data["agent_id"].as_str();
     let payload = data.get("payload").map(|v| v.to_string());
+    let current_stage = data["current_stage"].as_str();
+    let summary = data["summary"].as_str();
 
-    match task_db::update_task(&state.db, task_id, status, agent_id, payload.as_deref()).await {
+    match task_db::update_task(&state.db, task_id, status, agent_id, payload.as_deref(), current_stage, summary).await {
         Ok(Some(row)) => {
             let response = task_row_to_json(&row);
             info!(task_id = %task_id, "task updated");
@@ -411,6 +474,7 @@ async fn on_task_update(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
+            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
         }
         Ok(None) => {
             ack_error(ack, &format!("task not found: {task_id}"));
@@ -494,6 +558,7 @@ async fn on_task_delete(
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
+            let _ = socket.to("dashboard").emit(events::TASK_CHANGED, &broadcast);
         }
         Ok(false) => {
             ack_error(ack, &format!("task not found: {task_id}"));

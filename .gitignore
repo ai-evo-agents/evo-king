@@ -6,3 +6,4 @@ api-key.config
 gateway-running.conf
 gateway-backup-*.config
 backups/
+dashboard/

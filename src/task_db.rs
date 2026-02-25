@@ -121,6 +121,23 @@ pub async fn init_db(path: &str) -> Result<Database> {
     .await
     .context("create cron_jobs table")?;
 
+    // Task logs — detailed running log entries for task progress
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS task_logs (
+            id         TEXT PRIMARY KEY,
+            task_id    TEXT NOT NULL,
+            level      TEXT NOT NULL DEFAULT 'info',
+            message    TEXT NOT NULL,
+            detail     TEXT NOT NULL DEFAULT '',
+            agent_id   TEXT NOT NULL DEFAULT '',
+            stage      TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create task_logs table")?;
+
     // ── Schema migrations ────────────────────────────────────────────────────
     // Add new columns to agent_status for enhanced metadata persistence.
     // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch the
@@ -133,6 +150,10 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE pipeline_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE pipeline_runs ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE pipeline_runs ADD COLUMN error TEXT",
+        // Phase 6: task management — link tasks to pipeline runs
+        "ALTER TABLE tasks ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE tasks ADD COLUMN current_stage TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
     ];
 
     for sql in &migrations {
@@ -279,6 +300,43 @@ pub async fn log_config_event(
     Ok(())
 }
 
+/// Row returned from config_history queries.
+#[derive(Debug, Clone)]
+pub struct ConfigHistoryRow {
+    pub id: String,
+    pub config_hash: String,
+    pub action: String,
+    pub backup_path: String,
+    pub timestamp: String,
+}
+
+/// List config change history, newest first.
+pub async fn list_config_history(db: &Database, limit: u32) -> Result<Vec<ConfigHistoryRow>> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, config_hash, action, backup_path, timestamp
+             FROM config_history ORDER BY timestamp DESC LIMIT ?1",
+            libsql::params![i64::from(limit)],
+        )
+        .await
+        .context("list config history")?;
+
+    let mut history = Vec::new();
+    while let Some(row) = rows.next().await.context("read config_history row")? {
+        history.push(ConfigHistoryRow {
+            id: row.get::<String>(0).context("read id")?,
+            config_hash: row.get::<String>(1).context("read config_hash")?,
+            action: row.get::<String>(2).context("read action")?,
+            backup_path: row.get::<String>(3).unwrap_or_default(),
+            timestamp: row.get::<String>(4).context("read timestamp")?,
+        });
+    }
+
+    Ok(history)
+}
+
 // ─── Tasks ────────────────────────────────────────────────────────────────────
 
 /// Internal task row from database queries.
@@ -289,9 +347,15 @@ pub struct TaskRow {
     pub status: String,
     pub agent_id: String,
     pub payload: String,
+    pub run_id: String,
+    pub current_stage: String,
+    pub summary: String,
     pub created_at: String,
     pub updated_at: String,
 }
+
+/// SELECT column list for task queries — must match `row_to_task` field order.
+const TASK_COLS: &str = "id, task_type, status, agent_id, payload, run_id, current_stage, summary, created_at, updated_at";
 
 fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
     Ok(TaskRow {
@@ -300,17 +364,28 @@ fn row_to_task(row: &libsql::Row) -> Result<TaskRow> {
         status: row.get::<String>(2).context("read status")?,
         agent_id: row.get::<String>(3).context("read agent_id")?,
         payload: row.get::<String>(4).context("read payload")?,
-        created_at: row.get::<String>(5).context("read created_at")?,
-        updated_at: row.get::<String>(6).context("read updated_at")?,
+        run_id: row.get::<String>(5).unwrap_or_default(),
+        current_stage: row.get::<String>(6).unwrap_or_default(),
+        summary: row.get::<String>(7).unwrap_or_default(),
+        created_at: row.get::<String>(8).context("read created_at")?,
+        updated_at: row.get::<String>(9).context("read updated_at")?,
     })
 }
 
 /// Create a new task and return the full row.
+///
+/// `run_id` links the task to a pipeline run (1:1).
+/// `current_stage` is the initial pipeline stage (e.g. "learning").
+/// `summary` is a human-readable description of the current activity.
 pub async fn create_task(
     db: &Database,
     task_type: &str,
+    status: &str,
     agent_id: Option<&str>,
     payload: &str,
+    run_id: &str,
+    current_stage: &str,
+    summary: &str,
 ) -> Result<TaskRow> {
     let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -318,13 +393,17 @@ pub async fn create_task(
     let agent = agent_id.unwrap_or("");
 
     conn.execute(
-        "INSERT INTO tasks (id, task_type, status, agent_id, payload, created_at, updated_at)
-         VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6)",
+        "INSERT INTO tasks (id, task_type, status, agent_id, payload, run_id, current_stage, summary, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         libsql::params![
             id.as_str(),
             task_type,
+            status,
             agent,
             payload,
+            run_id,
+            current_stage,
+            summary,
             now.as_str(),
             now.as_str()
         ],
@@ -335,9 +414,12 @@ pub async fn create_task(
     Ok(TaskRow {
         id,
         task_type: task_type.to_string(),
-        status: "pending".to_string(),
+        status: status.to_string(),
         agent_id: agent.to_string(),
         payload: payload.to_string(),
+        run_id: run_id.to_string(),
+        current_stage: current_stage.to_string(),
+        summary: summary.to_string(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -347,12 +429,9 @@ pub async fn create_task(
 pub async fn get_task(db: &Database, task_id: &str) -> Result<Option<TaskRow>> {
     let conn = db_connect(db).await?;
 
+    let sql = format!("SELECT {} FROM tasks WHERE id = ?1", TASK_COLS);
     let mut rows = conn
-        .query(
-            "SELECT id, task_type, status, agent_id, payload, created_at, updated_at
-             FROM tasks WHERE id = ?1",
-            libsql::params![task_id],
-        )
+        .query(&sql, libsql::params![task_id])
         .await
         .context("query task by id")?;
 
@@ -371,9 +450,7 @@ pub async fn list_tasks(
 ) -> Result<Vec<TaskRow>> {
     let conn = db_connect(db).await?;
 
-    let mut sql = String::from(
-        "SELECT id, task_type, status, agent_id, payload, created_at, updated_at FROM tasks WHERE 1=1",
-    );
+    let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", TASK_COLS);
     let mut param_values: Vec<libsql::Value> = Vec::new();
 
     if let Some(status) = status_filter {
@@ -401,13 +478,16 @@ pub async fn list_tasks(
     Ok(tasks)
 }
 
-/// Update a task's status, agent assignment, or payload. Returns the updated row.
+/// Update a task's status, agent, payload, current_stage, and/or summary.
+/// Returns the updated row.
 pub async fn update_task(
     db: &Database,
     task_id: &str,
     status: Option<&str>,
     agent_id: Option<&str>,
     payload: Option<&str>,
+    current_stage: Option<&str>,
+    summary: Option<&str>,
 ) -> Result<Option<TaskRow>> {
     let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -426,6 +506,14 @@ pub async fn update_task(
     if let Some(p) = payload {
         param_values.push(libsql::Value::Text(p.to_string()));
         set_parts.push(format!("payload = ?{}", param_values.len()));
+    }
+    if let Some(cs) = current_stage {
+        param_values.push(libsql::Value::Text(cs.to_string()));
+        set_parts.push(format!("current_stage = ?{}", param_values.len()));
+    }
+    if let Some(sm) = summary {
+        param_values.push(libsql::Value::Text(sm.to_string()));
+        set_parts.push(format!("summary = ?{}", param_values.len()));
     }
 
     param_values.push(libsql::Value::Text(task_id.to_string()));
@@ -459,6 +547,171 @@ pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
         .context("delete task")?;
 
     Ok(rows_affected > 0)
+}
+
+/// Get the current (most recent) task. Prefers running tasks over others.
+///
+/// Returns the most recently created task with status "running", or the most
+/// recently created task of any status if none is running.
+pub async fn get_current_task(db: &Database) -> Result<Option<TaskRow>> {
+    let conn = db_connect(db).await?;
+
+    // Try running first
+    let sql = format!(
+        "SELECT {} FROM tasks WHERE status = 'running' ORDER BY created_at DESC LIMIT 1",
+        TASK_COLS
+    );
+    let mut rows = conn.query(&sql, ()).await.context("get current running task")?;
+    if let Some(row) = rows.next().await.context("read row")? {
+        return Ok(Some(row_to_task(&row)?));
+    }
+
+    // Fall back to most recent of any status
+    let sql = format!(
+        "SELECT {} FROM tasks ORDER BY created_at DESC LIMIT 1",
+        TASK_COLS
+    );
+    let mut rows = conn.query(&sql, ()).await.context("get most recent task")?;
+    match rows.next().await.context("read row")? {
+        Some(row) => Ok(Some(row_to_task(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Find the running task associated with a pipeline run_id.
+pub async fn get_task_by_run_id(db: &Database, run_id: &str) -> Result<Option<TaskRow>> {
+    let conn = db_connect(db).await?;
+
+    let sql = format!(
+        "SELECT {} FROM tasks WHERE run_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        TASK_COLS
+    );
+    let mut rows = conn
+        .query(&sql, libsql::params![run_id])
+        .await
+        .context("get task by run_id")?;
+
+    match rows.next().await.context("read row")? {
+        Some(row) => Ok(Some(row_to_task(&row)?)),
+        None => Ok(None),
+    }
+}
+
+// ─── Task logs ──────────────────────────────────────────────────────────────
+
+/// Row returned from task_logs queries.
+#[derive(Debug, Clone)]
+pub struct TaskLogRow {
+    pub id: String,
+    pub task_id: String,
+    pub level: String,
+    pub message: String,
+    pub detail: String,
+    pub agent_id: String,
+    pub stage: String,
+    pub created_at: String,
+}
+
+fn row_to_task_log(row: &libsql::Row) -> Result<TaskLogRow> {
+    Ok(TaskLogRow {
+        id: row.get::<String>(0).context("read id")?,
+        task_id: row.get::<String>(1).context("read task_id")?,
+        level: row.get::<String>(2).context("read level")?,
+        message: row.get::<String>(3).context("read message")?,
+        detail: row.get::<String>(4).unwrap_or_default(),
+        agent_id: row.get::<String>(5).unwrap_or_default(),
+        stage: row.get::<String>(6).unwrap_or_default(),
+        created_at: row.get::<String>(7).context("read created_at")?,
+    })
+}
+
+/// Insert a new task log entry and return the full row.
+pub async fn create_task_log(
+    db: &Database,
+    task_id: &str,
+    level: &str,
+    message: &str,
+    detail: &str,
+    agent_id: &str,
+    stage: &str,
+) -> Result<TaskLogRow> {
+    let conn = db_connect(db).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO task_logs (id, task_id, level, message, detail, agent_id, stage, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        libsql::params![
+            id.as_str(),
+            task_id,
+            level,
+            message,
+            detail,
+            agent_id,
+            stage,
+            now.as_str()
+        ],
+    )
+    .await
+    .context("create task log")?;
+
+    Ok(TaskLogRow {
+        id,
+        task_id: task_id.to_string(),
+        level: level.to_string(),
+        message: message.to_string(),
+        detail: detail.to_string(),
+        agent_id: agent_id.to_string(),
+        stage: stage.to_string(),
+        created_at: now,
+    })
+}
+
+/// List log entries for a task, ordered by creation time (oldest first).
+/// Supports pagination via `limit` and `offset`.
+pub async fn list_task_logs(
+    db: &Database,
+    task_id: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<TaskLogRow>> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, task_id, level, message, detail, agent_id, stage, created_at
+             FROM task_logs WHERE task_id = ?1
+             ORDER BY created_at ASC LIMIT ?2 OFFSET ?3",
+            libsql::params![task_id, i64::from(limit), i64::from(offset)],
+        )
+        .await
+        .context("list task logs")?;
+
+    let mut logs = Vec::new();
+    while let Some(row) = rows.next().await.context("read task_log row")? {
+        logs.push(row_to_task_log(&row)?);
+    }
+
+    Ok(logs)
+}
+
+/// Count total log entries for a task (for pagination).
+pub async fn count_task_logs(db: &Database, task_id: &str) -> Result<u32> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM task_logs WHERE task_id = ?1",
+            libsql::params![task_id],
+        )
+        .await
+        .context("count task logs")?;
+
+    match rows.next().await.context("read count row")? {
+        Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) as u32),
+        None => Ok(0),
+    }
 }
 
 // ─── Pipeline runs ──────────────────────────────────────────────────────────
