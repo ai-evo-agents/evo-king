@@ -553,8 +553,44 @@ async fn debug_prompt_handler(
         agent_role.replace('-', "_")
     );
 
+    // Create a task for this debug prompt
+    let task_id = match task_db::create_task(
+        &state.db,
+        "debug_prompt",
+        "running",
+        None,
+        &json!({ "prompt": prompt, "model": model, "agent_role": agent_role }).to_string(),
+        "", // run_id
+        "", // current_stage
+        "", // summary
+        "", // parent_id
+    )
+    .await
+    {
+        Ok(row) => row.id,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to create task for debug prompt");
+            String::new()
+        }
+    };
+
+    // Emit task:invite to kernel room so agents can join the task room
+    if !task_id.is_empty() {
+        let invite = json!({ "task_id": task_id, "task_type": "debug_prompt" });
+        let _ = state
+            .io
+            .to(evo_common::messages::events::ROOM_KERNEL)
+            .emit(evo_common::messages::events::TASK_INVITE, &invite);
+        // Notify dashboard of new task
+        let _ = state.io.to("dashboard").emit(
+            evo_common::messages::events::TASK_CHANGED,
+            json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_prompt", "status": "running" } }),
+        );
+    }
+
     let payload = json!({
         "request_id": request_id,
+        "task_id": task_id,
         "model": model,
         "prompt": prompt,
         "provider": provider,
@@ -564,6 +600,7 @@ async fn debug_prompt_handler(
 
     info!(
         request_id = %request_id,
+        task_id = %task_id,
         role = %agent_role,
         model = %model,
         room = %room,
@@ -575,7 +612,7 @@ async fn debug_prompt_handler(
         .to(room)
         .emit(evo_common::messages::events::DEBUG_PROMPT, &payload)
     {
-        Ok(_) => Json(json!({ "success": true, "request_id": request_id })),
+        Ok(_) => Json(json!({ "success": true, "request_id": request_id, "task_id": task_id })),
         Err(e) => {
             tracing::error!(err = %e, "failed to emit debug:prompt");
             Json(json!({ "success": false, "error": e.to_string() }))
@@ -604,21 +641,63 @@ async fn debug_bash_handler(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // Create a task for this bash command
+    let task_id = match task_db::create_task(
+        &state.db,
+        "debug_bash",
+        "running",
+        None,
+        &json!({ "command": command }).to_string(),
+        "", // run_id
+        "", // current_stage
+        "", // summary
+        "", // parent_id
+    )
+    .await
+    {
+        Ok(row) => row.id,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to create task for debug bash");
+            String::new()
+        }
+    };
+
     info!(
         request_id = %request_id,
+        task_id = %task_id,
         command = %command,
         "debug bash command requested"
     );
 
-    let io = state.io.clone();
-    let req_id = request_id.clone();
-    tokio::spawn(run_bash_pty(command, req_id, io));
+    // Emit task:invite to kernel room
+    if !task_id.is_empty() {
+        let invite = json!({ "task_id": task_id, "task_type": "debug_bash" });
+        let _ = state
+            .io
+            .to(evo_common::messages::events::ROOM_KERNEL)
+            .emit(evo_common::messages::events::TASK_INVITE, &invite);
+        // Notify dashboard of new task
+        let _ = state.io.to("dashboard").emit(
+            evo_common::messages::events::TASK_CHANGED,
+            json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_bash", "status": "running" } }),
+        );
+    }
 
-    Json(json!({ "success": true, "request_id": request_id }))
+    let io = state.io.clone();
+    let db = Arc::clone(&state.db);
+    let req_id = request_id.clone();
+    let tid = task_id.clone();
+    tokio::spawn(run_bash_pty_with_task(command, req_id, io, tid, db));
+
+    Json(json!({ "success": true, "request_id": request_id, "task_id": task_id }))
 }
 
 /// Async wrapper: spawns PTY subprocess in a blocking thread, streams output
 /// to the dashboard room via Socket.IO, then emits a final `debug:response`.
+///
+/// **Deprecated:** Use `run_bash_pty_with_task` instead, which adds task tracking,
+/// task room output, and automatic evaluation dispatch.
+#[allow(dead_code)]
 async fn run_bash_pty(command: String, request_id: String, io: SocketIo) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let start = std::time::Instant::now();
@@ -665,6 +744,188 @@ async fn run_bash_pty(command: String, request_id: String, io: SocketIo) {
             }
         }),
     );
+}
+
+/// Async wrapper with task tracking: spawns PTY subprocess, streams output to
+/// both the dashboard room and the task-specific room, batches task_logs every
+/// 1.5s, accumulates output (max 8KB) for evaluation, and emits `task:evaluate`
+/// on completion.
+async fn run_bash_pty_with_task(
+    command: String,
+    request_id: String,
+    io: SocketIo,
+    task_id: String,
+    db: Arc<libsql::Database>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let start = std::time::Instant::now();
+    let has_task = !task_id.is_empty();
+
+    // Async emitter: forwards PTY chunks to dashboard + task room, batches logs
+    let io_emit = io.clone();
+    let req_id_emit = request_id.clone();
+    let task_id_emit = task_id.clone();
+    let db_emit = Arc::clone(&db);
+    let emit_handle = tokio::spawn(async move {
+        let mut chunk_index = 0u32;
+        let mut accumulated = String::new();
+        const MAX_ACCUMULATED: usize = 8192;
+        let mut log_buffer = String::new();
+        let mut last_log_flush = tokio::time::Instant::now();
+        let log_interval = tokio::time::Duration::from_millis(1500);
+
+        while let Some(text) = rx.recv().await {
+            // Emit to dashboard
+            let _ = io_emit.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({
+                    "event": "debug:stream",
+                    "data": {
+                        "request_id": req_id_emit,
+                        "task_id": task_id_emit,
+                        "delta": text,
+                        "chunk_index": chunk_index,
+                    }
+                }),
+            );
+
+            // Emit task:output to the task room
+            if has_task {
+                let task_room = format!(
+                    "{}{}",
+                    evo_common::messages::events::ROOM_TASK_PREFIX,
+                    task_id_emit,
+                );
+                let _ = io_emit.to(task_room).emit(
+                    evo_common::messages::events::TASK_OUTPUT,
+                    serde_json::json!({
+                        "task_id": task_id_emit,
+                        "request_id": req_id_emit,
+                        "delta": text,
+                        "chunk_index": chunk_index,
+                    }),
+                );
+            }
+
+            // Accumulate output for evaluation (up to MAX_ACCUMULATED)
+            if accumulated.len() < MAX_ACCUMULATED {
+                let remaining = MAX_ACCUMULATED - accumulated.len();
+                if text.len() <= remaining {
+                    accumulated.push_str(&text);
+                } else {
+                    accumulated.push_str(&text[..remaining]);
+                }
+            }
+
+            // Batch task logs every 1.5s
+            if has_task {
+                log_buffer.push_str(&text);
+                if last_log_flush.elapsed() >= log_interval {
+                    let _ = task_db::create_task_log(
+                        &db_emit,
+                        &task_id_emit,
+                        "output",
+                        "bash output chunk",
+                        &log_buffer,
+                        "",
+                        "running",
+                    )
+                    .await;
+                    log_buffer.clear();
+                    last_log_flush = tokio::time::Instant::now();
+                }
+            }
+
+            chunk_index += 1;
+        }
+
+        // Flush remaining log buffer
+        if has_task && !log_buffer.is_empty() {
+            let _ = task_db::create_task_log(
+                &db_emit,
+                &task_id_emit,
+                "output",
+                "bash output chunk",
+                &log_buffer,
+                "",
+                "running",
+            )
+            .await;
+        }
+
+        accumulated
+    });
+
+    // Blocking PTY runner — tx is moved in; dropping it closes the channel
+    let exit_code: i32 = tokio::task::spawn_blocking(move || pty_run_blocking(command, tx))
+        .await
+        .unwrap_or(1);
+
+    // Channel is now closed (tx dropped); wait for emitter to drain
+    let accumulated = emit_handle.await.unwrap_or_default();
+
+    let elapsed = start.elapsed().as_millis() as u64;
+
+    // Emit final debug:response to dashboard
+    let _ = io.to("dashboard").emit(
+        "dashboard:event",
+        serde_json::json!({
+            "event": "debug:response",
+            "data": {
+                "request_id": request_id,
+                "task_id": task_id,
+                "response": format!("\n[exit {}]", exit_code),
+                "latency_ms": elapsed,
+                "entry_type": "bash",
+            }
+        }),
+    );
+
+    // Update task status and emit task:evaluate
+    if has_task {
+        let status = if exit_code == 0 {
+            "completed"
+        } else {
+            "failed"
+        };
+        let _ = task_db::update_task(&db, &task_id, Some(status), None, None, None, None).await;
+
+        let _ = task_db::create_task_log(
+            &db,
+            &task_id,
+            "info",
+            &format!("bash command finished with exit code {exit_code}"),
+            &accumulated,
+            "",
+            status,
+        )
+        .await;
+
+        let eval_payload = serde_json::json!({
+            "task_id": task_id,
+            "request_id": request_id,
+            "exit_code": exit_code,
+            "latency_ms": elapsed,
+            "output_preview": accumulated,
+        });
+        let task_room = format!(
+            "{}{}",
+            evo_common::messages::events::ROOM_TASK_PREFIX,
+            task_id,
+        );
+        let _ = io
+            .to("role:evaluation")
+            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload);
+        let _ = io
+            .to(task_room)
+            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload);
+
+        // Notify dashboard of task completion
+        let _ = io.to("dashboard").emit(
+            evo_common::messages::events::TASK_CHANGED,
+            serde_json::json!({ "action": "updated", "task": { "id": task_id, "status": status } }),
+        );
+    }
 }
 
 /// Synchronous PTY subprocess runner (designed for `tokio::task::spawn_blocking`).

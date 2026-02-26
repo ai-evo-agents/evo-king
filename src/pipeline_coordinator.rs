@@ -82,6 +82,20 @@ impl PipelineCoordinator {
             self.broadcast_task_log(&task_row.id, log);
         }
 
+        // Emit task:invite to kernel room so all agents can join the task room
+        let invite_payload = serde_json::json!({
+            "task_id": task_row.id,
+            "task_type": "pipeline",
+            "payload": { "run_id": run_id, "stage": stage_str, "trigger": trigger_metadata },
+        });
+        if let Err(e) = self
+            .io
+            .to("kernel")
+            .emit(events::TASK_INVITE, &invite_payload)
+        {
+            warn!(run_id = %run_id, err = %e, "failed to emit task:invite to kernel room");
+        }
+
         // Emit pipeline:next to the role room for the first stage
         let payload = serde_json::json!({
             "run_id": run_id,
@@ -634,7 +648,7 @@ impl PipelineCoordinator {
         let _ = self.io.to("dashboard").emit("task:changed", &payload);
     }
 
-    /// Broadcast a `task:log` event to the dashboard room.
+    /// Broadcast a `task:log` event to the dashboard room and the task room.
     fn broadcast_task_log(&self, task_id: &str, log: &task_db::TaskLogRow) {
         let payload = serde_json::json!({
             "task_id": task_id,
@@ -649,6 +663,10 @@ impl PipelineCoordinator {
             },
         });
         let _ = self.io.to("dashboard").emit("task:log", &payload);
+
+        // Also emit to the task-specific room so joined agents can observe
+        let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
+        let _ = self.io.to(task_room).emit(events::TASK_LOG, &payload);
     }
 
     /// List all pipeline runs for HTTP API.

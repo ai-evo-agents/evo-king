@@ -217,6 +217,8 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE tasks ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
         // Phase 7: subtask hierarchy support
         "ALTER TABLE tasks ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''",
+        // Phase 8: task room — index task_logs for fast lookup
+        "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)",
     ];
 
     for sql in &migrations {
@@ -833,6 +835,39 @@ pub async fn count_task_logs(db: &Database, task_id: &str) -> Result<u32> {
         Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) as u32),
         None => Ok(0),
     }
+}
+
+/// Get all task log messages concatenated as text, limited to `max_chars`.
+/// Used by the evaluation flow to build a summarisable output.
+#[allow(dead_code)]
+pub async fn get_task_logs_text(db: &Database, task_id: &str, max_chars: usize) -> Result<String> {
+    let conn = db_connect(db).await?;
+    let mut rows = conn
+        .query(
+            "SELECT message, detail FROM task_logs WHERE task_id = ?1 ORDER BY created_at ASC",
+            libsql::params![task_id],
+        )
+        .await
+        .context("get task logs text")?;
+
+    let mut text = String::new();
+    while let Some(row) = rows.next().await.context("read log row")? {
+        let msg = row.get::<String>(0).unwrap_or_default();
+        let detail = row.get::<String>(1).unwrap_or_default();
+        if !msg.is_empty() {
+            text.push_str(&msg);
+            text.push('\n');
+        }
+        if !detail.is_empty() && text.len() < max_chars {
+            text.push_str(&detail);
+            text.push('\n');
+        }
+        if text.len() >= max_chars {
+            text.truncate(max_chars);
+            break;
+        }
+    }
+    Ok(text)
 }
 
 // ─── Pipeline runs ──────────────────────────────────────────────────────────

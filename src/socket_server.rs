@@ -43,6 +43,10 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         let s_memory_update = Arc::clone(&state);
         let s_memory_delete = Arc::clone(&state);
 
+        // Task room handler arcs
+        let s_task_join = Arc::clone(&state);
+        let s_task_summary = Arc::clone(&state);
+
         // dashboard:subscribe — dashboard clients join a read-only room
         socket.on(
             "dashboard:subscribe",
@@ -116,6 +120,30 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                         "dashboard:event",
                         serde_json::json!({ "event": "debug:response", "data": data }),
                     );
+
+                    // If task_id is present, update task and emit task:evaluate
+                    if let Some(task_id) = data["task_id"].as_str().filter(|s| !s.is_empty()) {
+                        let _ = task_db::update_task(
+                            &state.db, task_id,
+                            Some("completed"), None, None, None, None,
+                        ).await;
+
+                        let _ = task_db::create_task_log(
+                            &state.db, task_id, "info",
+                            "debug:response completed",
+                            data["response"].as_str().unwrap_or(""),
+                            agent_id, "response",
+                        ).await;
+
+                        let eval_payload = serde_json::json!({
+                            "task_id": task_id,
+                            "request_id": request_id,
+                            "agent_id": agent_id,
+                        });
+                        let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
+                        let _ = state.io.to("role:evaluation").emit(events::TASK_EVALUATE, &eval_payload);
+                        let _ = state.io.to(task_room).emit(events::TASK_EVALUATE, &eval_payload);
+                    }
                 }
             },
         );
@@ -130,6 +158,12 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                         "dashboard:event",
                         serde_json::json!({ "event": "debug:stream", "data": data }),
                     );
+
+                    // If task_id is present, also emit task:output to the task room
+                    if let Some(task_id) = data["task_id"].as_str().filter(|s| !s.is_empty()) {
+                        let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
+                        let _ = state.io.to(task_room).emit(events::TASK_OUTPUT, &data);
+                    }
                 }
             },
         );
@@ -216,6 +250,36 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
                 let state = Arc::clone(&s_memory_delete);
                 async move { on_memory_delete(s, data, ack, state).await }
+            },
+        );
+
+        // ── Task room events ──────────────────────────────────────────────────
+
+        // task:join — agent joins a task-specific room
+        socket.on(
+            events::TASK_JOIN,
+            move |s: SocketRef, Data::<serde_json::Value>(data)| {
+                let _state = Arc::clone(&s_task_join);
+                let task_id = data["task_id"].as_str().unwrap_or("").to_string();
+                let agent_id = data["agent_id"].as_str().unwrap_or("unknown").to_string();
+                async move {
+                    if task_id.is_empty() {
+                        warn!("task:join without task_id");
+                        return;
+                    }
+                    let room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
+                    let _ = s.join(room.clone());
+                    info!(agent_id = %agent_id, task_id = %task_id, room = %room, "agent joined task room");
+                }
+            },
+        );
+
+        // task:summary — evaluation agent reports task summary
+        socket.on(
+            events::TASK_SUMMARY,
+            move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
+                let state = Arc::clone(&s_task_summary);
+                async move { on_task_summary(s, data, ack, state).await }
             },
         );
 
@@ -934,5 +998,120 @@ async fn on_memory_delete(
             warn!(err = %e, "failed to delete memory");
             ack_error(ack, "internal server error");
         }
+    }
+}
+
+// ─── Task summary handler ────────────────────────────────────────────────────
+
+async fn on_task_summary(
+    socket: SocketRef,
+    data: serde_json::Value,
+    ack: AckSender,
+    state: Arc<KingState>,
+) {
+    let task_id = match data["task_id"].as_str() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            ack_error(ack, "missing task_id");
+            return;
+        }
+    };
+    let agent_id = data["agent_id"].as_str().unwrap_or("unknown");
+    let summary = data["summary"].as_str().unwrap_or("");
+    let score = data["score"].as_f64().unwrap_or(0.0);
+    let tags = match data.get("tags") {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    };
+
+    info!(
+        task_id = %task_id,
+        agent_id = %agent_id,
+        score = %score,
+        "task:summary received"
+    );
+
+    // 1. Update task summary in DB
+    if let Err(e) = task_db::update_task(
+        &state.db,
+        task_id,
+        Some("evaluated"),
+        None,
+        None,
+        None,
+        Some(summary),
+    )
+    .await
+    {
+        warn!(err = %e, "failed to update task summary");
+        ack_error(ack, "failed to update task");
+        return;
+    }
+
+    // 2. Create a task_log entry
+    let _ = task_db::create_task_log(
+        &state.db,
+        task_id,
+        "info",
+        &format!("task evaluated: score={score}"),
+        summary,
+        agent_id,
+        "evaluation",
+    )
+    .await;
+
+    // 3. Create a memory with scope="system", category="case"
+    let metadata = serde_json::json!({
+        "task_id": task_id,
+        "score": score,
+    })
+    .to_string();
+
+    let memory_result = memory_db::create_memory(
+        &state.db,
+        "system",
+        "case",
+        &format!("task:{task_id}"),
+        &metadata,
+        &tags,
+        agent_id,
+        "", // run_id
+        "", // skill_id
+        score,
+    )
+    .await;
+
+    if let Ok(mem) = &memory_result {
+        // 4. Upsert L0 tier with summary text
+        let _ = memory_db::upsert_tier(&state.db, &mem.id, "l0", summary).await;
+
+        // 5. Bind memory to task
+        let _ = memory_db::bind_task_memory(&state.db, task_id, &mem.id).await;
+    }
+
+    let _ = ack.send(&serde_json::json!({ "success": true, "task_id": task_id }));
+
+    // 6. Broadcast task:changed to kernel + dashboard rooms
+    if let Ok(Some(updated_task)) = task_db::get_task(&state.db, task_id).await {
+        let task_json = task_row_to_json(&updated_task);
+        let broadcast = serde_json::json!({ "action": "evaluated", "task": task_json });
+        let _ = socket
+            .to(events::ROOM_KERNEL)
+            .emit(events::TASK_CHANGED, &broadcast);
+        let _ = socket
+            .to("dashboard")
+            .emit(events::TASK_CHANGED, &broadcast);
+        // Also send as dashboard:event so the debug page picks it up
+        let dashboard_evt = serde_json::json!({
+            "event": "task:changed",
+            "data": { "action": "evaluated", "task": task_json },
+        });
+        let _ = socket
+            .to("dashboard")
+            .emit("dashboard:event", &dashboard_evt);
     }
 }
