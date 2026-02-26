@@ -5,7 +5,7 @@ Central orchestrator for the evo agent system. Manages agent lifecycle, config l
 ## Quick Commands
 
 ```bash
-# Run (default port 3000)
+# Run (default port 3300)
 cargo run
 
 # Build release
@@ -18,14 +18,14 @@ cargo test
 cargo clippy -- -D warnings
 
 # Health check (once running)
-curl http://localhost:3000/health
+curl http://localhost:3300/health
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KING_PORT` | `3000` | HTTP + Socket.IO server port |
+| `KING_PORT` | `3300` | HTTP + Socket.IO server port |
 | `KING_DB_PATH` | `king.db` | libSQL (Turso) local database path |
 | `GATEWAY_CONFIG_PATH` | `../evo-gateway/gateway.json` | Path watched for config changes |
 | `AGENTS_ROOT` | — | Root dir for kernel agent discovery |
@@ -48,7 +48,7 @@ src/
 
 ## Socket.IO Protocol
 
-King runs a Socket.IO server on port 3000 (namespace `/`).
+King runs a Socket.IO server on port 3300 (namespace `/`).
 
 ### Rooms
 

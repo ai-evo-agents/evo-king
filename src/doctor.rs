@@ -103,7 +103,7 @@ pub async fn run_doctor(evo_home: &str, fix: bool) -> Result<()> {
     // ── Gateway connectivity ────────────────────────────────────────────
     let gw_ok = check_gateway_health().await;
     results.push(CheckResult {
-        name: "gateway:8080/health".into(),
+        name: "gateway:3301/health".into(),
         passed: gw_ok,
         message: if gw_ok {
             "reachable".into()
@@ -260,7 +260,7 @@ async fn check_gateway_health() -> bool {
 
     match client {
         Ok(c) => c
-            .get("http://localhost:8080/health")
+            .get("http://localhost:3301/health")
             .send()
             .await
             .map(|r| r.status().is_success())

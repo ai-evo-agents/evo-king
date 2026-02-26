@@ -12,14 +12,14 @@
 #   ~/.evo-agents/run.sh --help       Show this help
 #
 # Startup order:
-#   1. evo-gateway (background, port 8080)
+#   1. evo-gateway (background, port 3301)
 #   2. Wait for gateway health check
-#   3. evo-king (foreground, port 3000 — auto-discovers and spawns kernel agents)
+#   3. evo-king (foreground, port 3300 — auto-discovers and spawns kernel agents)
 #
 # Environment:
 #   EVO_HOME               Installation directory (default: ~/.evo-agents)
-#   EVO_KING_PORT          King server port (default: 3000)
-#   EVO_GATEWAY_PORT       Gateway server port (default: 8080)
+#   EVO_KING_PORT          King server port (default: 3300)
+#   EVO_GATEWAY_PORT       Gateway server port (default: 3301)
 #   OPENAI_API_KEY         OpenAI API key (passed to gateway)
 #   ANTHROPIC_API_KEY      Anthropic API key (passed to gateway)
 #   RUST_LOG               Log level filter (default: info)
@@ -32,8 +32,8 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 
 EVO_HOME="${EVO_HOME:-${HOME}/.evo-agents}"
-EVO_KING_PORT="${EVO_KING_PORT:-3000}"
-EVO_GATEWAY_PORT="${EVO_GATEWAY_PORT:-8080}"
+EVO_KING_PORT="${EVO_KING_PORT:-3300}"
+EVO_GATEWAY_PORT="${EVO_GATEWAY_PORT:-3301}"
 
 PIDFILE_GATEWAY="${EVO_HOME}/data/gateway.pid"
 PIDFILE_KING="${EVO_HOME}/data/king.pid"

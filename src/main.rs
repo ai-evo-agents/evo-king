@@ -29,7 +29,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::info;
 
-const DEFAULT_PORT: u16 = 3000;
+const DEFAULT_PORT: u16 = 3300;
 const DEFAULT_DB_PATH: &str = "king.db";
 const DEFAULT_GATEWAY_CONFIG: &str = "../evo-gateway/gateway.json";
 const DEFAULT_KERNEL_AGENTS_DIR: &str = "..";

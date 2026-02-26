@@ -1,8 +1,8 @@
 # evo-king
 
-Central orchestrator for the Evo self-evolution agent system. Manages gateway config lifecycle, spawns and monitors agent runner processes, serves a Socket.IO server for bidirectional agent communication, and maintains a local task database for evolution pipeline tracking.
+Central orchestrator for the Evo self-evolution agent system. Manages gateway config lifecycle, spawns and monitors agent runner processes, serves a Socket.IO server for bidirectional agent communication, coordinates the evolution pipeline, and maintains a local database for tasks, memories, and pipeline tracking.
 
-**Status:** Active development — agent management, pipeline coordinator, and task DB operational.
+**Status:** Active development — agent management, pipeline coordinator, memory system, cron manager, and task DB operational.
 
 ---
 
@@ -12,7 +12,7 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
 |-------|------|
 | evo-common | Shared types (dependency) |
 | evo-gateway | API aggregator — king manages its config lifecycle |
-| **evo-king** | Central orchestrator, port 3000 |
+| **evo-king** | Central orchestrator, port 3300 |
 | evo-agents | Runner binary — runners connect to king via Socket.IO |
 | evo-kernel-agent-* | 6 kernel agent repos (learning, building, pre-load, evaluation, skill-manage, update) |
 | evo-user-agent-template | Template for creating user agents |
@@ -22,7 +22,7 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
 ## Architecture
 
 ```
-                    evo-king (port 3000)
+                    evo-king (port 3300)
                     ┌─────────────────────────────────────────┐
                     │  Socket.IO Server (socketioxide)         │
                     │  ┌──────────────┐ ┌──────────────┐      │
@@ -35,9 +35,20 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
                     │  │  test -> swap -> backup        │      │
                     │  └───────────────────────────────┘      │
                     │  ┌───────────────────────────────┐      │
+                    │  │   Pipeline Coordinator         │      │
+                    │  │   5-stage evolution pipeline    │      │
+                    │  └───────────────────────────────┘      │
+                    │  ┌───────────────────────────────┐      │
+                    │  │   Cron Manager                 │      │
+                    │  │   Scheduled system tasks        │      │
+                    │  └───────────────────────────────┘      │
+                    │  ┌───────────────────────────────┐      │
                     │  │     Turso Local DB (libSQL)    │      │
                     │  │  tasks, pipeline_runs,         │      │
-                    │  │  agent_status, config_history  │      │
+                    │  │  agent_status, config_history, │      │
+                    │  │  cron_jobs, task_logs,          │      │
+                    │  │  memories, memory_tiers,        │      │
+                    │  │  task_memories                  │      │
                     │  └───────────────────────────────┘      │
                     └─────────────────────┬───────────────────┘
                                           │ socket.io
@@ -95,50 +106,122 @@ Registered agents can be queried via the `GET /agents` HTTP endpoint.
 
 ## Database Schema
 
-Local file `king.db` (gitignored). Managed via Turso/libSQL.
+Local file `king.db` (gitignored). Managed via Turso/libSQL. Tables created automatically on first run.
+
+### Core Tables
 
 ```sql
+-- Active tasks
 CREATE TABLE tasks (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    agent_id TEXT,
-    payload TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    id          TEXT PRIMARY KEY,
+    task_type   TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    agent_id    TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 
+-- Pipeline execution history
 CREATE TABLE pipeline_runs (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL DEFAULT '',
-    stage TEXT NOT NULL,
+    id          TEXT PRIMARY KEY,
+    stage       TEXT NOT NULL,
     artifact_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending',
-    agent_id TEXT NOT NULL DEFAULT '',
-    result TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    status      TEXT NOT NULL DEFAULT 'pending',
+    result      TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 
+-- Agent status + heartbeat tracking
 CREATE TABLE agent_status (
     agent_id       TEXT PRIMARY KEY,
     role           TEXT NOT NULL DEFAULT '',
     status         TEXT NOT NULL DEFAULT 'offline',
-    last_heartbeat TEXT NOT NULL,
-    capabilities   TEXT NOT NULL DEFAULT '[]',
-    skills         TEXT NOT NULL DEFAULT '[]',
-    pid            INTEGER NOT NULL DEFAULT 0
+    last_heartbeat TEXT NOT NULL
 );
 
+-- Gateway config change audit trail
 CREATE TABLE config_history (
-    id TEXT PRIMARY KEY,
+    id          TEXT PRIMARY KEY,
     config_hash TEXT NOT NULL,
-    action TEXT NOT NULL,
-    backup_path TEXT,
+    action      TEXT NOT NULL,
+    backup_path TEXT NOT NULL DEFAULT '',
+    timestamp   TEXT NOT NULL
+);
+```
+
+### Cron & Logging Tables
+
+```sql
+-- Cron job registry — system and user-defined recurring tasks
+CREATE TABLE cron_jobs (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    schedule    TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    last_run_at TEXT,
+    next_run_at TEXT,
+    last_status TEXT,
+    last_error  TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- Task execution logs
+CREATE TABLE task_logs (
+    id         TEXT PRIMARY KEY,
+    task_id    TEXT NOT NULL,
+    level      TEXT NOT NULL DEFAULT 'info',
+    message    TEXT NOT NULL,
+    detail     TEXT NOT NULL DEFAULT '',
+    agent_id   TEXT NOT NULL DEFAULT '',
+    stage      TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 ```
+
+### Memory Tables
+
+The memory system provides a tiered storage model (L0/L1/L2) for agents to persist and retrieve knowledge across pipeline runs.
+
+```sql
+-- Core memory records
+CREATE TABLE memories (
+    id              TEXT PRIMARY KEY,
+    scope           TEXT NOT NULL DEFAULT 'system',
+    category        TEXT NOT NULL DEFAULT 'general',
+    key             TEXT NOT NULL DEFAULT '',
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    tags            TEXT NOT NULL DEFAULT '',
+    agent_id        TEXT NOT NULL DEFAULT '',
+    run_id          TEXT NOT NULL DEFAULT '',
+    skill_id        TEXT NOT NULL DEFAULT '',
+    relevance_score REAL NOT NULL DEFAULT 0.0,
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Tiered content (L0 = raw, L1 = processed, L2 = compressed/summary)
+CREATE TABLE memory_tiers (
+    id         TEXT PRIMARY KEY,
+    memory_id  TEXT NOT NULL,
+    tier       TEXT NOT NULL,
+    content    TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Task-memory junction — binds memories to tasks for fast filtering
+CREATE TABLE task_memories (
+    id         TEXT PRIMARY KEY,
+    task_id    TEXT NOT NULL,
+    memory_id  TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+```
+
+**Indexes:** `memories.scope`, `memories.category`, `memories.agent_id`, `memory_tiers.memory_id`, `task_memories.task_id`, `task_memories.memory_id`.
 
 ---
 
@@ -161,19 +244,37 @@ Learning → Building → PreLoad → Evaluation → SkillManage → [complete]
 
 ---
 
+## Memory System
+
+King provides a centralized memory store for agents to persist knowledge across pipeline runs and sessions.
+
+**Concepts:**
+- **Scope:** `system` (shared), `agent` (per-agent), `pipeline` (per-run)
+- **Category:** Free-form grouping (e.g. `general`, `skill`, `config`, `observation`)
+- **Tiers:** L0 (raw data), L1 (processed/structured), L2 (compressed/summary)
+- **Relevance scoring:** Memories track `relevance_score` and `access_count` for retrieval ranking
+- **Task binding:** Memories can be linked to specific tasks via the `task_memories` junction table
+
+**API:** See the Memory endpoints section in HTTP Endpoints below.
+
+---
+
 ## Source File Layout
 
 ```
 src/
-  main.rs                  Entry point: init DB, Socket.IO, pipeline coordinator, HTTP routes
+  main.rs                  Entry point: init DB, Socket.IO, pipeline, cron, HTTP routes, dashboard
+  state.rs                 Shared application state (DB, Socket.IO, registry, coordinator)
+  error.rs                 Error types
+  task_db.rs               Turso/libSQL database management (schema, CRUD for all tables)
+  memory_db.rs             Memory CRUD: create, get, update, delete, search, tiers, stats
+  socket_server.rs         socketioxide event handlers for all Socket.IO events
   config_watcher.rs        Watch gateway.config via notify crate, emit change events internally
   gateway_manager.rs       Config lifecycle: test -> health check -> swap -> backup or revert
   agent_manager.rs         Discover evo-kernel-agent-* repos, spawn/stop/monitor runner processes
   pipeline_coordinator.rs  Pipeline state machine: start/advance/timeout pipeline runs
-  socket_server.rs         socketioxide event handlers for all Socket.IO events
-  task_db.rs               Turso/libSQL database management (agents, tasks, pipeline runs)
-  state.rs                 Shared application state (DB, Socket.IO, registry, coordinator)
-  error.rs                 Error types
+  cron_manager.rs          System cron job scheduling (update checks, gateway health)
+  doctor.rs                Installation validation and repair (evo-king doctor subcommand)
 ```
 
 ---
@@ -194,6 +295,9 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 evo-common = "0.2"
+clap = "4"
+tower-http = "0.6"
+uuid = "1"
 ```
 
 ---
@@ -241,9 +345,13 @@ cargo run --release
 cargo run -- --version
 # or after install:
 evo-king --version
+
+# Run doctor (validate installation)
+cargo run -- doctor
+cargo run -- doctor --fix   # auto-repair
 ```
 
-The server starts on port 3000 by default.
+The server starts on port 3300 by default.
 
 All evo binaries support `--version` / `-V` to print their name and version.
 
@@ -253,26 +361,82 @@ All evo binaries support `--version` / `-V` to print their name and version.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `EVO_KING_PORT` | Port for the Socket.IO / HTTP server | `3000` |
-| `EVO_KING_DB_PATH` | Path to the local libSQL database file | `king.db` |
-| `EVO_GATEWAY_CONFIG` | Path to the gateway config file to watch | `gateway.config` |
-| `EVO_GATEWAY_RUNNING_CONFIG` | Path to the active gateway config | `gateway-running.conf` |
-| `EVO_GATEWAY_BACKUP_DIR` | Directory for gateway config backups | `backups/` |
-| `EVO_LOG_PATH` | Path for structured JSON log output | `logs/king.log` |
+| `KING_PORT` | Port for the Socket.IO / HTTP server | `3300` |
+| `KING_DB_PATH` | Path to the local libSQL database file | `king.db` |
+| `GATEWAY_CONFIG_PATH` | Path to the gateway config file to watch | `../evo-gateway/gateway.json` |
 | `KERNEL_AGENTS_DIR` | Directory containing `evo-kernel-agent-*` repos | `..` (parent dir) |
 | `RUNNER_BINARY` | Path to the evo-runner binary | `../evo-agents/target/release/evo-runner` |
+| `EVO_LOG_DIR` | Log output directory | `./logs` |
+| `RUST_LOG` | Log level filter | `info` |
 
 ---
 
 ## HTTP Endpoints
 
+### Core
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns king service status |
 | `GET` | `/agents` | Returns all registered agents with full metadata |
-| `POST` | `/pipeline/start` | Trigger a new pipeline run (body: `{"trigger": "manual"}`) |
+
+### Pipeline
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/pipeline/start` | Trigger a new pipeline run (`{"trigger": "manual"}`) |
 | `GET` | `/pipeline/runs` | List all pipeline run stages |
 | `GET` | `/pipeline/runs/:run_id` | Detailed stage history for a specific run |
+
+### Tasks
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/tasks` | List tasks (query: `limit`, `status`, `agent_id`) |
+| `GET` | `/task/current` | Get the current active task |
+| `GET` | `/task/:task_id/logs` | Logs for a specific task |
+| `GET` | `/task/:task_id/subtasks` | Subtasks for a specific task |
+
+### Memory
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/memories` | List memories (query filters: scope, category, agent_id) |
+| `POST` | `/memories` | Create a new memory record |
+| `POST` | `/memories/search` | Search memories by criteria |
+| `GET` | `/memories/stats` | Memory usage statistics |
+| `GET` | `/memories/:memory_id` | Get a specific memory |
+| `PUT` | `/memories/:memory_id` | Update a memory |
+| `DELETE` | `/memories/:memory_id` | Delete a memory |
+| `GET` | `/memories/:memory_id/tiers` | List all tiers for a memory |
+| `POST` | `/memories/:memory_id/tiers` | Upsert a tier (L0/L1/L2) |
+| `GET` | `/memories/:memory_id/tiers/:tier` | Get a specific tier content |
+| `DELETE` | `/memories/:memory_id/tiers/:tier` | Delete a specific tier |
+| `GET` | `/memories/:memory_id/tasks` | List tasks linked to a memory |
+| `GET` | `/task/:task_id/memories` | List memories linked to a task |
+| `POST` | `/task/:task_id/memories` | Bind a memory to a task |
+
+### Dashboard & Config
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/gateway/config` | Read current gateway config |
+| `PUT` | `/gateway/config` | Update gateway config |
+| `GET` | `/config-history` | Gateway config change audit trail |
+
+### Admin
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/admin/config-sync` | Force sync gateway config |
+| `GET` | `/admin/crons` | List all registered cron jobs |
+| `POST` | `/admin/crons/:name/run` | Manually trigger a cron job |
+
+### Debug
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/debug/prompt` | Debug LLM prompt construction |
 
 ---
 
