@@ -146,6 +146,11 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/agents", get(list_agents_handler))
+        .route(
+            "/agents/{agent_id}/model",
+            get(agent_model_get_handler).put(agent_model_put_handler),
+        )
+        .route("/gateway/models", get(gateway_models_handler))
         .route("/pipeline/start", post(pipeline_start_handler))
         .route("/pipeline/runs", get(pipeline_list_handler))
         .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
@@ -292,6 +297,7 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
                         "skills":         serde_json::from_str::<serde_json::Value>(&a.skills)
                             .unwrap_or(json!([])),
                         "pid":            a.pid,
+                        "preferred_model": a.preferred_model,
                     })
                 })
                 .collect();
@@ -299,6 +305,62 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
             Json(json!({ "agents": list, "count": count }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// PUT /agents/:agent_id/model — set an agent's preferred model.
+async fn agent_model_put_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let model = body["model"].as_str().unwrap_or("").to_string();
+    match task_db::set_agent_model(&state.db, &agent_id, &model).await {
+        Ok(()) => {
+            info!(agent_id = %agent_id, model = %model, "updated agent model preference");
+            Json(json!({ "success": true, "agent_id": agent_id, "model": model }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /agents/:agent_id/model — get an agent's preferred model.
+async fn agent_model_get_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match task_db::get_agent_model(&state.db, &agent_id).await {
+        Ok(model) => Json(json!({ "agent_id": agent_id, "model": model })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /gateway/models — proxy to evo-gateway's /v1/models endpoint.
+async fn gateway_models_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
+    // Read gateway config to find the server address
+    let gateway_addr = match std::fs::read_to_string(&state.gateway_config_path) {
+        Ok(content) => {
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(cfg) => {
+                    let host = cfg["server"]["host"].as_str().unwrap_or("127.0.0.1");
+                    let port = cfg["server"]["port"].as_u64().unwrap_or(8080);
+                    // If host is 0.0.0.0, connect to localhost instead
+                    let connect_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+                    format!("http://{connect_host}:{port}")
+                }
+                Err(_) => "http://127.0.0.1:8080".to_string(),
+            }
+        }
+        Err(_) => "http://127.0.0.1:8080".to_string(),
+    };
+
+    let url = format!("{gateway_addr}/v1/models");
+    match state.http_client.get(&url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => Json(json),
+            Err(e) => Json(json!({ "error": format!("parse error: {e}") })),
+        },
+        Err(e) => Json(json!({ "error": format!("gateway unreachable: {e}") })),
     }
 }
 

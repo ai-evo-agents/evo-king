@@ -219,6 +219,8 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE tasks ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''",
         // Phase 8: task room — index task_logs for fast lookup
         "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)",
+        // Phase 9: per-agent model preference
+        "ALTER TABLE agent_status ADD COLUMN preferred_model TEXT NOT NULL DEFAULT ''",
     ];
 
     for sql in &migrations {
@@ -309,6 +311,7 @@ pub struct AgentRow {
     pub capabilities: String,
     pub skills: String,
     pub pid: i64,
+    pub preferred_model: String,
 }
 
 /// List all registered agents ordered by agent_id.
@@ -317,7 +320,7 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
 
     let mut rows = conn
         .query(
-            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid
+            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model
              FROM agent_status ORDER BY agent_id",
             (),
         )
@@ -334,10 +337,40 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
             capabilities: row.get::<String>(4).unwrap_or_else(|_| "[]".to_string()),
             skills: row.get::<String>(5).unwrap_or_else(|_| "[]".to_string()),
             pid: row.get::<i64>(6).unwrap_or(0),
+            preferred_model: row.get::<String>(7).unwrap_or_default(),
         });
     }
 
     Ok(agents)
+}
+
+/// Set the preferred model for an agent.
+pub async fn set_agent_model(db: &Database, agent_id: &str, model: &str) -> Result<()> {
+    let conn = db_connect(db).await?;
+    conn.execute(
+        "UPDATE agent_status SET preferred_model = ?1 WHERE agent_id = ?2",
+        libsql::params![model, agent_id],
+    )
+    .await
+    .context("set agent model")?;
+    Ok(())
+}
+
+/// Get the preferred model for an agent.
+pub async fn get_agent_model(db: &Database, agent_id: &str) -> Result<String> {
+    let conn = db_connect(db).await?;
+    let mut rows = conn
+        .query(
+            "SELECT preferred_model FROM agent_status WHERE agent_id = ?1",
+            libsql::params![agent_id],
+        )
+        .await
+        .context("get agent model")?;
+    if let Some(row) = rows.next().await.context("read row")? {
+        Ok(row.get::<String>(0).unwrap_or_default())
+    } else {
+        Ok(String::new())
+    }
 }
 
 // ─── Config history ───────────────────────────────────────────────────────────

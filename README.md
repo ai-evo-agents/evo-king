@@ -135,10 +135,11 @@ CREATE TABLE pipeline_runs (
 
 -- Agent status + heartbeat tracking
 CREATE TABLE agent_status (
-    agent_id       TEXT PRIMARY KEY,
-    role           TEXT NOT NULL DEFAULT '',
-    status         TEXT NOT NULL DEFAULT 'offline',
-    last_heartbeat TEXT NOT NULL
+    agent_id        TEXT PRIMARY KEY,
+    role            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'offline',
+    last_heartbeat  TEXT NOT NULL,
+    preferred_model TEXT NOT NULL DEFAULT ''
 );
 
 -- Gateway config change audit trail
@@ -284,20 +285,24 @@ src/
 ```toml
 [dependencies]
 axum = "0.7"
-socketioxide = "0.13"
+socketioxide = "0.14"
 tokio = { version = "1", features = ["full"] }
-notify = "8.2"
+notify = "8"
 libsql = "0.6"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
-evo-common = "0.2"
-clap = "4"
-tower-http = "0.6"
-uuid = "1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2.0"
+reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
+uuid = { version = "1.0", features = ["v4"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+evo-common = { path = "../evo-common" }
+portable-pty = "0.8"
 ```
 
 ---
@@ -416,10 +421,18 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | `GET` | `/task/:task_id/memories` | List memories linked to a task |
 | `POST` | `/task/:task_id/memories` | Bind a memory to a task |
 
-### Dashboard & Config
+### Agents
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/agents/{agent_id}/model` | Get an agent's preferred model |
+| `PUT` | `/agents/{agent_id}/model` | Set an agent's preferred model (`{"model": "..."}`) |
+
+### Gateway & Config
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/gateway/models` | Proxy to evo-gateway's `/v1/models` — lists available LLM models |
 | `GET` | `/gateway/config` | Read current gateway config |
 | `PUT` | `/gateway/config` | Update gateway config |
 | `GET` | `/config-history` | Gateway config change audit trail |
