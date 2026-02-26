@@ -48,6 +48,20 @@ jobs:
           sed -i.bak 's|evo-common.*=.*{.*path.*=.*"[^"]*".*}|evo-common = "0.7"|' Cargo.toml
           rm -f Cargo.toml.bak
 
+      - name: Build dashboard
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Clone and build evo-dashboard
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/ai-evo-agents/evo-dashboard.git /tmp/evo-dashboard
+          cd /tmp/evo-dashboard
+          npm ci
+          npm run build
+          cp -r out "${GITHUB_WORKSPACE}/dashboard"
+
       - name: Build (cross)
         uses: houseabsolute/actions-rust-cross@v1
         with:
@@ -71,6 +85,7 @@ jobs:
             cp install.sh staging/ 2>/dev/null || true
             cp run.sh staging/ 2>/dev/null || true
             cp update.sh staging/ 2>/dev/null || true
+            cp -r dashboard staging/dashboard 2>/dev/null || true
             cd staging && 7z a "../${ARCHIVE}" .
           else
             BIN="${BINARY_NAME}"
@@ -79,6 +94,7 @@ jobs:
             cp install.sh staging/ 2>/dev/null || true
             cp run.sh staging/ 2>/dev/null || true
             cp update.sh staging/ 2>/dev/null || true
+            cp -r dashboard staging/dashboard 2>/dev/null || true
             tar czvf "$ARCHIVE" -C staging .
           fi
 

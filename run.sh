@@ -404,6 +404,7 @@ do_start() {
     KERNEL_AGENTS_DIR="${EVO_HOME}" \
     EVO_KING_PORT="${EVO_KING_PORT}" \
     EVO_KING_DB_PATH="${EVO_HOME}/data/king.db" \
+    EVO_DASHBOARD_DIR="${EVO_HOME}/dashboard" \
     EVO_LOG_DIR="${EVO_HOME}/logs" \
     EVO_GATEWAY_CONFIG="${EVO_HOME}/data/gateway.json" \
     EVO_GATEWAY_RUNNING_CONFIG="${EVO_HOME}/data/gateway-running.conf" \

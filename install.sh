@@ -297,7 +297,7 @@ install_service_binaries() {
                 continue
             fi
 
-            # For king: also extract run.sh and update.sh if present
+            # For king: also extract run.sh, update.sh, and dashboard if present
             if [[ "${service}" == "evo-king" ]]; then
                 if [[ -f "${tmp_extract}/run.sh" ]]; then
                     cp "${tmp_extract}/run.sh" "${EVO_HOME}/run.sh"
@@ -308,6 +308,11 @@ install_service_binaries() {
                     cp "${tmp_extract}/update.sh" "${EVO_HOME}/data/update.sh"
                     chmod +x "${EVO_HOME}/data/update.sh"
                     info "Copied update.sh -> ${EVO_HOME}/data/update.sh"
+                fi
+                if [[ -d "${tmp_extract}/dashboard" ]]; then
+                    rm -rf "${EVO_HOME}/dashboard"
+                    cp -r "${tmp_extract}/dashboard" "${EVO_HOME}/dashboard"
+                    info "Installed dashboard -> ${EVO_HOME}/dashboard"
                 fi
             fi
         else
