@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
         .route("/task/{task_id}/subtasks", get(task_subtasks_handler))
         // ── Debug endpoints ─────────────────────────────────────────────────
         .route("/debug/prompt", post(debug_prompt_handler))
+        .route("/debug/bash", post(debug_bash_handler))
         // ── Admin endpoints ──────────────────────────────────────────────────
         .route("/admin/config-sync", post(admin_config_sync_handler))
         .route("/admin/crons", get(admin_list_crons_handler))
@@ -580,6 +581,170 @@ async fn debug_prompt_handler(
             Json(json!({ "success": false, "error": e.to_string() }))
         }
     }
+}
+
+/// POST /debug/bash — run a bash command in a PTY and stream output to dashboard.
+///
+/// Body: `{ "command": "...", "request_id": "optional-uuid" }`
+///
+/// Returns immediately with `{ success, request_id }`. Output streams via
+/// Socket.IO `debug:stream` events to the dashboard room. A final
+/// `debug:response` event signals completion with the process exit code.
+async fn debug_bash_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let command = match body["command"].as_str() {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return Json(json!({ "success": false, "error": "command is required" })),
+    };
+    let request_id = body["request_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    info!(
+        request_id = %request_id,
+        command = %command,
+        "debug bash command requested"
+    );
+
+    let io = state.io.clone();
+    let req_id = request_id.clone();
+    tokio::spawn(run_bash_pty(command, req_id, io));
+
+    Json(json!({ "success": true, "request_id": request_id }))
+}
+
+/// Async wrapper: spawns PTY subprocess in a blocking thread, streams output
+/// to the dashboard room via Socket.IO, then emits a final `debug:response`.
+async fn run_bash_pty(command: String, request_id: String, io: SocketIo) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let start = std::time::Instant::now();
+
+    // Async emitter: forwards PTY chunks to the dashboard
+    let io_emit = io.clone();
+    let req_id_emit = request_id.clone();
+    let emit_task = tokio::spawn(async move {
+        let mut chunk_index = 0u32;
+        while let Some(text) = rx.recv().await {
+            let _ = io_emit.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({
+                    "event": "debug:stream",
+                    "data": {
+                        "request_id": req_id_emit,
+                        "delta": text,
+                        "chunk_index": chunk_index,
+                    }
+                }),
+            );
+            chunk_index += 1;
+        }
+    });
+
+    // Blocking PTY runner — tx is moved in; dropping it closes the channel
+    let exit_code: i32 = tokio::task::spawn_blocking(move || pty_run_blocking(command, tx))
+        .await
+        .unwrap_or(1);
+
+    // Channel is now closed (tx dropped); wait for emitter to drain
+    let _ = emit_task.await;
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    let _ = io.to("dashboard").emit(
+        "dashboard:event",
+        serde_json::json!({
+            "event": "debug:response",
+            "data": {
+                "request_id": request_id,
+                "response": format!("\n[exit {}]", exit_code),
+                "latency_ms": elapsed,
+                "entry_type": "bash",
+            }
+        }),
+    );
+}
+
+/// Synchronous PTY subprocess runner (designed for `tokio::task::spawn_blocking`).
+///
+/// Spawns `bash -c <command>` in a pseudo-terminal so that subprocess TUIs
+/// (e.g. Codex CLI, htop) emit their full terminal output.  Streams raw PTY
+/// bytes (including ANSI escape sequences) via `tx`; the caller strips ANSI
+/// for display or renders with a terminal widget.
+///
+/// Returns the child process exit code.
+fn pty_run_blocking(command: String, tx: tokio::sync::mpsc::UnboundedSender<String>) -> i32 {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::Read;
+
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: 50,
+        cols: 220,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(format!("[PTY error: {e}]\n"));
+            return 1;
+        }
+    };
+
+    let mut cmd = CommandBuilder::new("bash");
+    cmd.arg("-c");
+    cmd.arg(&command);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLUMNS", "220");
+    cmd.env("LINES", "50");
+
+    // Spawn child on slave PTY
+    let child_result = pair.slave.spawn_command(cmd);
+    // Drop slave so we get EOF/EIO when child exits
+    drop(pair.slave);
+
+    let mut child = match child_result {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(format!("[spawn error: {e}]\n"));
+            return 1;
+        }
+    };
+
+    // Clone reader from master PTY
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(format!("[reader error: {e}]\n"));
+            return 1;
+        }
+    };
+
+    // Stream PTY output to the async emitter
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if tx.send(text).is_err() {
+                    break; // dashboard disconnected
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // EIO on macOS when child exits, or other terminal errors
+        }
+    }
+
+    // pair.master drops here, closing the master fd
+    drop(pair.master);
+
+    child
+        .wait()
+        .map(|s| if s.success() { 0i32 } else { 1i32 })
+        .unwrap_or(1)
 }
 
 /// Convert a TaskRow to JSON for HTTP responses.
