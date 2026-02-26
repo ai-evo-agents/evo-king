@@ -14,7 +14,7 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
 | evo-gateway | API aggregator — king manages its config lifecycle |
 | **evo-king** | Central orchestrator, port 3000 |
 | evo-agents | Runner binary — runners connect to king via Socket.IO |
-| evo-kernel-agent-* | 5 kernel agent repos (learning, building, pre-load, evaluation, skill-manage) |
+| evo-kernel-agent-* | 6 kernel agent repos (learning, building, pre-load, evaluation, skill-manage, update) |
 | evo-user-agent-template | Template for creating user agents |
 
 ---
@@ -198,6 +198,36 @@ evo-common = "0.2"
 
 ---
 
+## Quick Install
+
+The `install.sh` bootstrap script sets up the entire evo system:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ai-evo-agents/evo-king/main/install.sh | bash
+```
+
+Or run locally:
+
+```bash
+bash install.sh
+```
+
+**What it does:**
+1. Creates `~/.evo-agents/` directory structure (`bin/`, `data/`, `logs/`, `repos/`)
+2. Clones all evo repos (or `git pull` if already cloned)
+3. Downloads pre-built binaries from GitHub releases (evo-king, evo-gateway, kernel agents)
+4. Generates `repos.json` manifest with installed versions
+5. Creates a default `gateway.config`
+
+**Smart skip logic:**
+- Already-cloned repos are updated via `git pull` instead of re-cloning
+- Already-installed binaries are skipped if the installed version matches the latest release (tracked via `.version` sidecar files)
+- Missing GitHub releases are handled gracefully — the script warns and continues instead of failing
+
+**Re-running is safe:** Running `install.sh` again only downloads new/updated components.
+
+---
+
 ## Build and Run
 
 ```bash
@@ -206,9 +236,16 @@ cargo build --release
 
 # Run
 cargo run --release
+
+# Check version
+cargo run -- --version
+# or after install:
+evo-king --version
 ```
 
 The server starts on port 3000 by default.
+
+All evo binaries support `--version` / `-V` to print their name and version.
 
 ---
 
