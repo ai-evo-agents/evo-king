@@ -26,8 +26,9 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         // Pipeline stage result handler arc
         let s_stage_result = Arc::clone(&state);
 
-        // Debug handler arc
+        // Debug handler arcs
         let s_debug_response = Arc::clone(&state);
+        let s_debug_stream = Arc::clone(&state);
 
         // Task management handler arcs
         let s_task_create = Arc::clone(&state);
@@ -114,6 +115,20 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                     let _ = state.io.to("dashboard").emit(
                         "dashboard:event",
                         serde_json::json!({ "event": "debug:response", "data": data }),
+                    );
+                }
+            },
+        );
+
+        // debug:stream — agent sends streaming LLM token delta, relay to dashboard
+        socket.on(
+            events::DEBUG_STREAM,
+            move |_s: SocketRef, Data::<serde_json::Value>(data)| {
+                let state = Arc::clone(&s_debug_stream);
+                async move {
+                    let _ = state.io.to("dashboard").emit(
+                        "dashboard:event",
+                        serde_json::json!({ "event": "debug:stream", "data": data }),
                     );
                 }
             },
