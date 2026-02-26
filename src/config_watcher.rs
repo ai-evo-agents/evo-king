@@ -32,13 +32,13 @@ pub async fn watch_config(path: &str, state: Arc<KingState>) -> Result<()> {
 
     while let Some(event_result) = rx.recv().await {
         match event_result {
-            Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
-                // Only react if it's our specific file
-                if ev.paths.iter().any(|p| p == &path_buf) {
-                    info!("gateway config file changed, running lifecycle");
-                    if let Err(e) = gateway_manager::on_config_change(path, &state).await {
-                        error!(err = %e, "config lifecycle failed");
-                    }
+            Ok(ev)
+                if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_))
+                    && ev.paths.iter().any(|p| p == &path_buf) =>
+            {
+                info!("gateway config file changed, running lifecycle");
+                if let Err(e) = gateway_manager::on_config_change(path, &state).await {
+                    error!(err = %e, "config lifecycle failed");
                 }
             }
             Err(e) => warn!(err = %e, "filesystem watcher error"),

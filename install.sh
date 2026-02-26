@@ -174,17 +174,17 @@ download_file() {
 get_latest_version() {
     local repo="$1"
     local api_url="${GITHUB_API}/repos/${GITHUB_ORG}/${repo}/releases/latest"
-    local version
+    local response version
 
-    version="$(github_curl "${api_url}" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+    # Capture API response; tolerate HTTP errors (no release = 404)
+    response="$(github_curl "${api_url}" 2>/dev/null || true)"
 
-    if [[ -z "${version}" ]]; then
-        error "Failed to detect latest version for ${repo}"
-        error "Check https://github.com/${GITHUB_ORG}/${repo}/releases"
-        exit 1
+    if [[ -n "${response}" ]]; then
+        version="$(echo "${response}" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
     fi
 
-    echo "${version}"
+    # Return whatever we found (empty string if no release)
+    echo "${version:-}"
 }
 
 # -----------------------------------------------------------------------------
@@ -255,8 +255,29 @@ install_service_binaries() {
     header "Downloading service binaries"
 
     for service in "${SERVICE_BINARIES[@]}"; do
+        local bin_path="${EVO_HOME}/bin/${service}"
+        local version_file="${bin_path}.version"
+
+        # Get latest version; skip if no release available
         local version
         version="$(get_latest_version "${service}")"
+        if [[ -z "${version}" ]]; then
+            warn "No release found for ${service} — skipping (install manually or wait for first release)"
+            continue
+        fi
+
+        # Skip if binary exists and installed version matches latest
+        if [[ -x "${bin_path}" ]]; then
+            local installed_version
+            installed_version="$(cat "${version_file}" 2>/dev/null || true)"
+            if [[ "${installed_version}" == "${version}" ]]; then
+                info "${service} ${version} already up to date (skipping)"
+                eval "VERSION_${service//-/_}=${version}"
+                continue
+            fi
+            info "${service} ${installed_version:-unknown} -> ${version} (upgrading)"
+        fi
+
         info "${service} latest release: ${version}"
 
         # Download archive into a temp dir, then move the binary to bin/
@@ -266,13 +287,14 @@ install_service_binaries() {
         if download_release "${service}" "${service}" "${version}" "${target}" "${tmp_extract}"; then
             # Flat archive: binary is at archive root
             if [[ -f "${tmp_extract}/${service}" ]]; then
-                mv "${tmp_extract}/${service}" "${EVO_HOME}/bin/${service}"
-                chmod +x "${EVO_HOME}/bin/${service}"
-                success "Installed ${service} ${version} -> ${EVO_HOME}/bin/${service}"
+                mv "${tmp_extract}/${service}" "${bin_path}"
+                chmod +x "${bin_path}"
+                echo "${version}" > "${version_file}"
+                success "Installed ${service} ${version} -> ${bin_path}"
             else
-                error "Binary '${service}' not found in archive"
+                warn "Binary '${service}' not found in archive — skipping"
                 rm -rf "${tmp_extract}"
-                exit 1
+                continue
             fi
 
             # For king: also extract run.sh and update.sh if present
@@ -289,8 +311,9 @@ install_service_binaries() {
                 fi
             fi
         else
+            warn "Failed to download ${service} ${version} — skipping"
             rm -rf "${tmp_extract}"
-            exit 1
+            continue
         fi
 
         rm -rf "${tmp_extract}"
@@ -299,7 +322,7 @@ install_service_binaries() {
         eval "VERSION_${service//-/_}=${version}"
     done
 
-    success "Service binaries installed"
+    success "Service binaries step complete"
 }
 
 # -----------------------------------------------------------------------------
@@ -314,9 +337,34 @@ install_kernel_agents() {
     for entry in "${KERNEL_AGENTS[@]}"; do
         local repo="${entry%%:*}"
         local binary="${entry##*:}"
+        local agent_dir="${EVO_HOME}/${repo}"
+        local bin_path="${agent_dir}/${binary}"
+        local flat_bin_path="${EVO_HOME}/${binary}"
+        local version_file="${EVO_HOME}/${binary}.version"
 
+        # Get latest version; skip if no release available
         local version
         version="$(get_latest_version "${repo}")"
+        if [[ -z "${version}" ]]; then
+            warn "No release found for ${repo} — skipping (install manually or wait for first release)"
+            continue
+        fi
+
+        # Skip if agent binary exists and installed version matches latest
+        # Check both nested (repo/binary) and flat (binary) layouts
+        if [[ -x "${bin_path}" ]] || [[ -x "${flat_bin_path}" ]]; then
+            local installed_version
+            installed_version="$(cat "${version_file}" 2>/dev/null || true)"
+            if [[ "${installed_version}" == "${version}" ]]; then
+                info "${repo} ${version} already up to date (skipping)"
+                eval "VERSION_${repo//-/_}=${version}"
+                continue
+            fi
+            local existing_path="${bin_path}"
+            [[ -x "${flat_bin_path}" ]] && existing_path="${flat_bin_path}"
+            info "${repo} ${installed_version:-unknown} -> ${version} (upgrading)"
+        fi
+
         info "${repo} latest release: ${version}"
 
         # Agent archives contain a folder structure:
@@ -326,25 +374,28 @@ install_kernel_agents() {
         # Extract directly into EVO_HOME so the folder lands at the right place
         if download_release "${repo}" "${binary}" "${version}" "${target}" "${EVO_HOME}"; then
             # Ensure the binary inside the agent folder is executable
-            local agent_dir="${EVO_HOME}/${repo}"
             if [[ -d "${agent_dir}" ]]; then
-                # Make any binary files executable
-                if [[ -f "${agent_dir}/${binary}" ]]; then
-                    chmod +x "${agent_dir}/${binary}"
+                if [[ -f "${bin_path}" ]]; then
+                    chmod +x "${bin_path}"
                 fi
+                echo "${version}" > "${version_file}"
                 success "Installed ${repo} ${version} -> ${agent_dir}/"
+            elif [[ -x "${flat_bin_path}" ]]; then
+                echo "${version}" > "${version_file}"
+                success "Installed ${repo} ${version} -> ${flat_bin_path}"
             else
                 warn "Expected directory ${agent_dir} not found after extraction"
             fi
         else
-            exit 1
+            warn "Failed to download ${repo} ${version} — skipping"
+            continue
         fi
 
         # Store version for repos.json generation (dynamic variable)
         eval "VERSION_${repo//-/_}=${version}"
     done
 
-    success "Kernel agents installed"
+    success "Kernel agents step complete"
 }
 
 # -----------------------------------------------------------------------------
@@ -547,7 +598,7 @@ main() {
 
     if [[ -d "${EVO_HOME}/bin" ]]; then
         warn "Existing installation detected at ${EVO_HOME}"
-        warn "Binaries and agents will be overwritten; repos will be updated"
+        warn "Missing binaries/agents will be downloaded; repos will be updated"
         printf "  Continue? [y/N] "
         # When piped (curl | bash), stdin is the script itself.
         # Default to 'y' in non-interactive mode.
