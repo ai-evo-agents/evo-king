@@ -1,9 +1,11 @@
 use crate::agent_manager::AgentRegistry;
 use crate::pipeline_coordinator::PipelineCoordinator;
+use crate::system_discovery::SystemDiscovery;
 use libsql::Database;
 use reqwest::Client;
 use socketioxide::SocketIo;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Shared application state for the king process.
 ///
@@ -22,4 +24,6 @@ pub struct KingState {
     pub agent_registry: Arc<AgentRegistry>,
     /// Pipeline coordinator — manages the evolution pipeline state machine.
     pub pipeline_coordinator: Arc<PipelineCoordinator>,
+    /// Cached system discovery results (probed at startup, refreshable via REST).
+    pub system_discovery: Arc<RwLock<Option<SystemDiscovery>>>,
 }

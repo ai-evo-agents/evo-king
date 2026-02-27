@@ -83,6 +83,9 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         let s_task_join = Arc::clone(&state);
         let s_task_summary = Arc::clone(&state);
 
+        // System info handler arc
+        let s_system_info = Arc::clone(&state);
+
         // Disconnect handler arc
         let s_disconnect = Arc::clone(&state);
 
@@ -324,6 +327,28 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             },
         );
 
+        // king:system_info — agent requests system discovery data
+        socket.on(
+            events::KING_SYSTEM_INFO,
+            move |_s: SocketRef, _data: Data<serde_json::Value>, ack: AckSender| {
+                let state = Arc::clone(&s_system_info);
+                async move {
+                    let guard = state.system_discovery.read().await;
+                    match &*guard {
+                        Some(discovery) => {
+                            if let Ok(payload) = serde_json::to_value(discovery) {
+                                ack.send(&payload).ok();
+                            }
+                        }
+                        None => {
+                            ack.send(&serde_json::json!({"error": "system discovery not yet completed"}))
+                                .ok();
+                        }
+                    }
+                }
+            },
+        );
+
         socket.on_disconnect(
             move |s: SocketRef, reason: socketioxide::socket::DisconnectReason| {
                 let state = Arc::clone(&s_disconnect);
@@ -471,6 +496,16 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         "dashboard:event",
         serde_json::json!({ "event": "agent:register", "data": data }),
     );
+
+    // Send system discovery info to the newly registered agent
+    {
+        let guard = state.system_discovery.read().await;
+        if let Some(ref discovery) = *guard
+            && let Ok(payload) = serde_json::to_value(discovery)
+        {
+            let _ = socket.emit(events::KING_SYSTEM_INFO, &payload);
+        }
+    }
 }
 
 async fn on_status(data: serde_json::Value, state: Arc<KingState>) {

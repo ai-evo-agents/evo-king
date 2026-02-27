@@ -8,6 +8,7 @@ mod memory_db;
 mod pipeline_coordinator;
 mod socket_server;
 mod state;
+mod system_discovery;
 mod task_db;
 
 use agent_manager::AgentRegistry;
@@ -113,6 +114,15 @@ async fn main() -> Result<()> {
 
     let pipeline_coordinator = Arc::new(PipelineCoordinator::new(Arc::clone(&db_arc), io.clone()));
 
+    // ── System discovery ──────────────────────────────────────────────────────
+    info!("running system discovery");
+    let discovery = system_discovery::run_discovery().await;
+    match system_discovery::save_to_disk(&discovery).await {
+        Ok(path) => info!(path = %path, "system discovery saved"),
+        Err(e) => tracing::warn!(err = %e, "failed to save system discovery to disk"),
+    }
+    let system_discovery = Arc::new(tokio::sync::RwLock::new(Some(discovery)));
+
     let state = Arc::new(KingState {
         db: db_arc,
         io: io.clone(),
@@ -120,6 +130,7 @@ async fn main() -> Result<()> {
         gateway_config_path: gateway_config_path.clone(),
         agent_registry: Arc::clone(&agent_registry),
         pipeline_coordinator: Arc::clone(&pipeline_coordinator),
+        system_discovery,
     });
 
     // ── Socket.IO event handlers ──────────────────────────────────────────────
@@ -171,6 +182,9 @@ async fn main() -> Result<()> {
         .route("/admin/config-sync", post(admin_config_sync_handler))
         .route("/admin/crons", get(admin_list_crons_handler))
         .route("/admin/crons/{name}/run", post(admin_run_cron_handler))
+        // ── System discovery endpoints ────────────────────────────────────
+        .route("/system-info", get(system_info_handler))
+        .route("/system-info/refresh", post(system_info_refresh_handler))
         // ── Log & agent detail endpoints ──────────────────────────────────
         .route("/logs/events", get(event_log_list_handler))
         .route("/agents/{agent_id}/history", get(agent_history_handler))
@@ -283,6 +297,41 @@ async fn main() -> Result<()> {
 
 async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": "evo-king" }))
+}
+
+/// GET /system-info — return cached system discovery results.
+async fn system_info_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
+    let guard = state.system_discovery.read().await;
+    match &*guard {
+        Some(discovery) => {
+            Json(serde_json::to_value(discovery).unwrap_or(json!({"error": "serialization error"})))
+        }
+        None => Json(json!({"error": "system discovery not yet completed"})),
+    }
+}
+
+/// POST /system-info/refresh — re-run system discovery.
+async fn system_info_refresh_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    let discovery = system_discovery::run_discovery().await;
+    if let Err(e) = system_discovery::save_to_disk(&discovery).await {
+        tracing::warn!(err = %e, "failed to save refreshed system discovery");
+    }
+
+    let result =
+        serde_json::to_value(&discovery).unwrap_or(json!({"error": "serialization error"}));
+
+    let mut guard = state.system_discovery.write().await;
+    *guard = Some(discovery);
+    drop(guard);
+
+    // Broadcast updated system info to all connected agents
+    let _ = state
+        .io
+        .emit(evo_common::messages::events::KING_SYSTEM_INFO, &result);
+
+    Json(result)
 }
 
 /// GET /agents — list all registered agents with full metadata.

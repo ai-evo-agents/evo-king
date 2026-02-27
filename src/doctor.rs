@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// All expected kernel agent folder names.
-const KERNEL_AGENTS: &[(&str, &str)] = &[
+pub(crate) const KERNEL_AGENTS: &[(&str, &str)] = &[
     ("evo-kernel-agent-learning", "evo-agent-learning"),
     ("evo-kernel-agent-building", "evo-agent-building"),
     ("evo-kernel-agent-pre-load", "evo-agent-pre-load"),

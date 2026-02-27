@@ -103,6 +103,7 @@ Registered agents can be queried via the `GET /agents` HTTP endpoint. Full agent
 | `king:config_update` | King -> All | `KingConfigUpdate` | Broadcast config change notification |
 | `pipeline:next` | King -> Runner | `PipelineNext` | Advance to next pipeline stage |
 | `pipeline:stage_result` | Runner -> King | `PipelineStageResult` | Agent reports stage completion/failure |
+| `king:system_info` | King -> Runner | `SystemDiscovery` | System info sent on registration + on-demand |
 
 ---
 
@@ -267,6 +268,28 @@ CREATE TABLE socket_events (
 
 ---
 
+## System Discovery
+
+At startup, king probes the host system for CLI tools, versions, and environment info. Results are cached in memory, persisted to `~/.evo-agents/data/system_info.json`, and shared with agents.
+
+**What it discovers:**
+- **System info:** OS, version, architecture, hostname, CPU count, memory
+- **CLI tools:** rustc, cargo, rustup, cargo-clippy, cargo-fmt, node, npm, npx, bun, git, rg, curl, docker, python3
+- **Evo components:** evo-king, evo-gateway, evo-runner, and all 6 kernel agent binaries
+- **Checklist:** Pass/fail/suggested status for each tool and component
+
+**Tool statuses:**
+- `available` — tool found with version detected
+- `not_found` — tool not installed
+- `suggested` — not found, but recommended for the evo system
+
+**Agent integration:**
+- System info is automatically sent to each agent on registration via `king:system_info`
+- Agents can request it on-demand via Socket.IO ack
+- Available via `GET /system-info` and refreshable via `POST /system-info/refresh`
+
+---
+
 ## Pipeline Coordinator
 
 The `PipelineCoordinator` manages the evolution pipeline state machine:
@@ -306,7 +329,8 @@ King provides a centralized memory store for agents to persist knowledge across 
 ```
 src/
   main.rs                  Entry point: init DB, Socket.IO, pipeline, cron, HTTP routes, dashboard
-  state.rs                 Shared application state (DB, Socket.IO, registry, coordinator)
+  state.rs                 Shared application state (DB, Socket.IO, registry, coordinator, system discovery)
+  system_discovery.rs      Probe CLI tools, system info, evo components; persist to system_info.json
   error.rs                 Error types
   task_db.rs               Turso/libSQL database management (schema, CRUD for all tables)
   memory_db.rs             Memory CRUD: create, get, update, delete, search, tiers, stats
@@ -425,6 +449,8 @@ All evo binaries support `--version` / `-V` to print their name and version.
 |--------|------|-------------|
 | `GET` | `/health` | Returns king service status |
 | `GET` | `/agents` | Returns all registered agents with full metadata |
+| `GET` | `/system-info` | Returns cached system discovery (tools, versions, evo components, checklist) |
+| `POST` | `/system-info/refresh` | Re-probe system, save to disk, broadcast to agents |
 
 ### Pipeline
 
