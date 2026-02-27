@@ -171,6 +171,11 @@ async fn main() -> Result<()> {
         .route("/admin/config-sync", post(admin_config_sync_handler))
         .route("/admin/crons", get(admin_list_crons_handler))
         .route("/admin/crons/{name}/run", post(admin_run_cron_handler))
+        // ── Log & agent detail endpoints ──────────────────────────────────
+        .route("/logs/events", get(event_log_list_handler))
+        .route("/agents/{agent_id}/history", get(agent_history_handler))
+        .route("/agents/{agent_id}/detail", get(agent_detail_handler))
+        .route("/logs/system", get(system_log_handler))
         // ── Memory endpoints ───────────────────────────────────────────────
         .route(
             "/memories",
@@ -288,16 +293,23 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
                 .iter()
                 .map(|a| {
                     json!({
-                        "agent_id":       a.agent_id,
-                        "role":           a.role,
-                        "status":         a.status,
-                        "last_heartbeat": a.last_heartbeat,
-                        "capabilities":   serde_json::from_str::<serde_json::Value>(&a.capabilities)
+                        "agent_id":            a.agent_id,
+                        "role":                a.role,
+                        "status":              a.status,
+                        "last_heartbeat":      a.last_heartbeat,
+                        "capabilities":        serde_json::from_str::<serde_json::Value>(&a.capabilities)
                             .unwrap_or(json!([])),
-                        "skills":         serde_json::from_str::<serde_json::Value>(&a.skills)
+                        "skills":              serde_json::from_str::<serde_json::Value>(&a.skills)
                             .unwrap_or(json!([])),
-                        "pid":            a.pid,
-                        "preferred_model": a.preferred_model,
+                        "pid":                 a.pid,
+                        "preferred_model":     a.preferred_model,
+                        "soul_content":        a.soul_content,
+                        "binary_path":         a.binary_path,
+                        "version":             a.version,
+                        "first_registered_at": a.first_registered_at,
+                        "registration_count":  a.registration_count,
+                        "crash_count":         a.crash_count,
+                        "socket_id":           a.socket_id,
                     })
                 })
                 .collect();
@@ -1564,5 +1576,209 @@ async fn task_memory_bind_handler(
     match memory_db::bind_task_memory(&state.db, &task_id, memory_id).await {
         Ok(_) => Json(json!({ "success": true })),
         Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+// ─── Log & agent detail handlers ────────────────────────────────────────────
+
+/// Query parameters for GET /logs/events.
+#[derive(Deserialize)]
+struct EventLogQuery {
+    agent_id: Option<String>,
+    event_name: Option<String>,
+    direction: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// Query parameters for GET /agents/{id}/history.
+#[derive(Deserialize)]
+struct AgentHistoryQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+/// Query parameters for GET /logs/system.
+#[derive(Deserialize)]
+struct SystemLogQuery {
+    lines: Option<usize>,
+    component: Option<String>,
+}
+
+/// GET /logs/events — query Socket.IO event log.
+async fn event_log_list_handler(
+    State(state): State<Arc<KingState>>,
+    Query(params): Query<EventLogQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(100).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    let count = task_db::count_socket_events(
+        &state.db,
+        params.agent_id.as_deref(),
+        params.event_name.as_deref(),
+        params.direction.as_deref(),
+        params.since.as_deref(),
+        params.until.as_deref(),
+    )
+    .await
+    .unwrap_or(0);
+
+    match task_db::list_socket_events(
+        &state.db,
+        limit,
+        offset,
+        params.agent_id.as_deref(),
+        params.event_name.as_deref(),
+        params.direction.as_deref(),
+        params.since.as_deref(),
+        params.until.as_deref(),
+    )
+    .await
+    {
+        Ok(rows) => {
+            let events: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id":         r.id,
+                        "event_name": r.event_name,
+                        "direction":  r.direction,
+                        "agent_id":   r.agent_id,
+                        "socket_id":  r.socket_id,
+                        "room":       r.room,
+                        "payload":    serde_json::from_str::<serde_json::Value>(&r.payload)
+                            .unwrap_or(json!({})),
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "events": events, "count": count, "limit": limit, "offset": offset }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /agents/{agent_id}/history — agent state transition log.
+async fn agent_history_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Query(params): Query<AgentHistoryQuery>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    let count = task_db::count_agent_history(&state.db, &agent_id)
+        .await
+        .unwrap_or(0);
+
+    match task_db::list_agent_history(&state.db, &agent_id, limit, offset).await {
+        Ok(rows) => {
+            let history: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id":          r.id,
+                        "agent_id":    r.agent_id,
+                        "prev_status": r.prev_status,
+                        "new_status":  r.new_status,
+                        "trigger":     r.trigger,
+                        "detail":      r.detail,
+                        "pid":         r.pid,
+                        "created_at":  r.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({ "history": history, "count": count, "limit": limit, "offset": offset }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /agents/{agent_id}/detail — full agent info + recent history.
+async fn agent_detail_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let agent = match task_db::get_agent(&state.db, &agent_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Json(json!({ "error": format!("agent not found: {agent_id}") })),
+        Err(e) => return Json(json!({ "error": e.to_string() })),
+    };
+
+    let recent_history = task_db::list_agent_history(&state.db, &agent_id, 20, 0)
+        .await
+        .unwrap_or_default();
+
+    let history_json: Vec<serde_json::Value> = recent_history
+        .iter()
+        .map(|r| {
+            json!({
+                "id":          r.id,
+                "prev_status": r.prev_status,
+                "new_status":  r.new_status,
+                "trigger":     r.trigger,
+                "detail":      r.detail,
+                "pid":         r.pid,
+                "created_at":  r.created_at,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "agent": {
+            "agent_id":            agent.agent_id,
+            "role":                agent.role,
+            "status":              agent.status,
+            "last_heartbeat":      agent.last_heartbeat,
+            "capabilities":        serde_json::from_str::<serde_json::Value>(&agent.capabilities)
+                .unwrap_or(json!([])),
+            "skills":              serde_json::from_str::<serde_json::Value>(&agent.skills)
+                .unwrap_or(json!([])),
+            "pid":                 agent.pid,
+            "preferred_model":     agent.preferred_model,
+            "soul_content":        agent.soul_content,
+            "binary_path":         agent.binary_path,
+            "version":             agent.version,
+            "first_registered_at": agent.first_registered_at,
+            "registration_count":  agent.registration_count,
+            "crash_count":         agent.crash_count,
+            "socket_id":           agent.socket_id,
+        },
+        "recent_history": history_json,
+    }))
+}
+
+/// GET /logs/system — tail a component's log file.
+async fn system_log_handler(Query(params): Query<SystemLogQuery>) -> Json<serde_json::Value> {
+    let max_lines = params.lines.unwrap_or(100).min(1000);
+    let component = params.component.as_deref().unwrap_or("king");
+
+    // Sanitize component name to prevent path traversal
+    if component.contains('/') || component.contains('\\') || component.contains("..") {
+        return Json(json!({ "error": "invalid component name" }));
+    }
+
+    let log_dir = std::env::var("EVO_LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
+    let log_file = std::path::Path::new(&log_dir).join(format!("{component}.log"));
+
+    match tokio::fs::read_to_string(&log_file).await {
+        Ok(content) => {
+            let all_lines: Vec<&str> = content.lines().collect();
+            let total = all_lines.len();
+            let start = total.saturating_sub(max_lines);
+            let lines: Vec<&str> = all_lines[start..].to_vec();
+            Json(json!({
+                "lines": lines,
+                "component": component,
+                "total_lines": total,
+                "returned": lines.len(),
+            }))
+        }
+        Err(e) => Json(
+            json!({ "error": format!("cannot read log file: {e}"), "path": log_file.display().to_string() }),
+        ),
     }
 }

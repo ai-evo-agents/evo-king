@@ -199,6 +199,51 @@ pub async fn init_db(path: &str) -> Result<Database> {
     .await
     .context("create memory indexes")?;
 
+    // Agent history — tracks agent state transitions for debugging/audit
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_history (
+            id           TEXT PRIMARY KEY,
+            agent_id     TEXT NOT NULL,
+            prev_status  TEXT NOT NULL DEFAULT '',
+            new_status   TEXT NOT NULL,
+            trigger      TEXT NOT NULL DEFAULT '',
+            detail       TEXT NOT NULL DEFAULT '',
+            pid          INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create agent_history table")?;
+
+    // Socket.IO event log — audit trail for debugging agent communication
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS socket_events (
+            id          TEXT PRIMARY KEY,
+            event_name  TEXT NOT NULL,
+            direction   TEXT NOT NULL DEFAULT 'inbound',
+            agent_id    TEXT NOT NULL DEFAULT '',
+            socket_id   TEXT NOT NULL DEFAULT '',
+            room        TEXT NOT NULL DEFAULT '',
+            payload     TEXT NOT NULL DEFAULT '{}',
+            created_at  TEXT NOT NULL
+        )",
+        (),
+    )
+    .await
+    .context("create socket_events table")?;
+
+    // Agent history + socket event indexes
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_history_agent_id ON agent_history(agent_id);
+         CREATE INDEX IF NOT EXISTS idx_agent_history_created_at ON agent_history(created_at);
+         CREATE INDEX IF NOT EXISTS idx_socket_events_agent_id ON socket_events(agent_id);
+         CREATE INDEX IF NOT EXISTS idx_socket_events_event_name ON socket_events(event_name);
+         CREATE INDEX IF NOT EXISTS idx_socket_events_created_at ON socket_events(created_at);",
+    )
+    .await
+    .context("create agent_history + socket_events indexes")?;
+
     // ── Schema migrations ────────────────────────────────────────────────────
     // Add new columns to agent_status for enhanced metadata persistence.
     // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch the
@@ -221,6 +266,14 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)",
         // Phase 9: per-agent model preference
         "ALTER TABLE agent_status ADD COLUMN preferred_model TEXT NOT NULL DEFAULT ''",
+        // Phase 10: enriched agent metadata for robustness & self-upgrade
+        "ALTER TABLE agent_status ADD COLUMN soul_content TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_status ADD COLUMN binary_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_status ADD COLUMN version TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_status ADD COLUMN first_registered_at TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE agent_status ADD COLUMN registration_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_status ADD COLUMN crash_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_status ADD COLUMN socket_id TEXT NOT NULL DEFAULT ''",
     ];
 
     for sql in &migrations {
@@ -247,6 +300,8 @@ pub async fn init_db(path: &str) -> Result<Database> {
 /// - Pass `role = ""` to keep the existing role.
 /// - Pass `capabilities = None` / `skills = None` to keep existing values.
 /// - Pass `pid = None` or `Some(0)` to keep the existing PID.
+/// - Pass `soul_content`, `binary_path`, `version`, `socket_id` as `None` to keep existing values.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_agent(
     db: &Database,
     agent_id: &str,
@@ -255,6 +310,10 @@ pub async fn upsert_agent(
     capabilities: Option<&str>,
     skills: Option<&str>,
     pid: Option<u32>,
+    soul_content: Option<&str>,
+    binary_path: Option<&str>,
+    version: Option<&str>,
+    socket_id: Option<&str>,
 ) -> Result<()> {
     let conn = db_connect(db).await?;
     let now = chrono::Utc::now().to_rfc3339();
@@ -262,18 +321,28 @@ pub async fn upsert_agent(
     let caps = capabilities.unwrap_or("[]");
     let sk = skills.unwrap_or("[]");
     let p = pid.unwrap_or(0) as i64;
+    let soul = soul_content.unwrap_or("");
+    let bin = binary_path.unwrap_or("");
+    let ver = version.unwrap_or("");
+    let sid = socket_id.unwrap_or("");
 
     conn.execute(
-        "INSERT INTO agent_status (agent_id, role, status, last_heartbeat, capabilities, skills, pid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO agent_status (agent_id, role, status, last_heartbeat, capabilities, skills, pid,
+                                   soul_content, binary_path, version, first_registered_at, registration_count, socket_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?4, 1, ?11)
          ON CONFLICT(agent_id) DO UPDATE SET
-             role           = CASE WHEN ?2 = '' THEN role ELSE ?2 END,
-             status         = ?3,
-             last_heartbeat = ?4,
-             capabilities   = CASE WHEN ?5 = '[]' AND capabilities != '[]' THEN capabilities ELSE ?5 END,
-             skills         = CASE WHEN ?6 = '[]' AND skills != '[]' THEN skills ELSE ?6 END,
-             pid            = CASE WHEN ?7 = 0 THEN pid ELSE ?7 END",
-        libsql::params![agent_id, role, status, now.as_str(), caps, sk, p],
+             role               = CASE WHEN ?2 = '' THEN role ELSE ?2 END,
+             status             = ?3,
+             last_heartbeat     = ?4,
+             capabilities       = CASE WHEN ?5 = '[]' AND capabilities != '[]' THEN capabilities ELSE ?5 END,
+             skills             = CASE WHEN ?6 = '[]' AND skills != '[]' THEN skills ELSE ?6 END,
+             pid                = CASE WHEN ?7 = 0 THEN pid ELSE ?7 END,
+             soul_content       = CASE WHEN ?8 = '' THEN soul_content ELSE ?8 END,
+             binary_path        = CASE WHEN ?9 = '' THEN binary_path ELSE ?9 END,
+             version            = CASE WHEN ?10 = '' THEN version ELSE ?10 END,
+             registration_count = registration_count + 1,
+             socket_id          = CASE WHEN ?11 = '' THEN socket_id ELSE ?11 END",
+        libsql::params![agent_id, role, status, now.as_str(), caps, sk, p, soul, bin, ver, sid],
     )
     .await
     .context("upsert agent status")?;
@@ -312,6 +381,13 @@ pub struct AgentRow {
     pub skills: String,
     pub pid: i64,
     pub preferred_model: String,
+    pub soul_content: String,
+    pub binary_path: String,
+    pub version: String,
+    pub first_registered_at: String,
+    pub registration_count: i64,
+    pub crash_count: i64,
+    pub socket_id: String,
 }
 
 /// List all registered agents ordered by agent_id.
@@ -320,7 +396,8 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
 
     let mut rows = conn
         .query(
-            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model
+            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model,
+                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id
              FROM agent_status ORDER BY agent_id",
             (),
         )
@@ -338,10 +415,69 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
             skills: row.get::<String>(5).unwrap_or_else(|_| "[]".to_string()),
             pid: row.get::<i64>(6).unwrap_or(0),
             preferred_model: row.get::<String>(7).unwrap_or_default(),
+            soul_content: row.get::<String>(8).unwrap_or_default(),
+            binary_path: row.get::<String>(9).unwrap_or_default(),
+            version: row.get::<String>(10).unwrap_or_default(),
+            first_registered_at: row.get::<String>(11).unwrap_or_default(),
+            registration_count: row.get::<i64>(12).unwrap_or(0),
+            crash_count: row.get::<i64>(13).unwrap_or(0),
+            socket_id: row.get::<String>(14).unwrap_or_default(),
         });
     }
 
     Ok(agents)
+}
+
+/// Get a single agent by agent_id.
+pub async fn get_agent(db: &Database, agent_id: &str) -> Result<Option<AgentRow>> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model,
+                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id
+             FROM agent_status WHERE agent_id = ?1",
+            libsql::params![agent_id],
+        )
+        .await
+        .context("get agent")?;
+
+    match rows.next().await.context("read agent row")? {
+        Some(row) => Ok(Some(AgentRow {
+            agent_id: row.get::<String>(0).context("read agent_id")?,
+            role: row.get::<String>(1).context("read role")?,
+            status: row.get::<String>(2).context("read status")?,
+            last_heartbeat: row.get::<String>(3).context("read last_heartbeat")?,
+            capabilities: row.get::<String>(4).unwrap_or_else(|_| "[]".to_string()),
+            skills: row.get::<String>(5).unwrap_or_else(|_| "[]".to_string()),
+            pid: row.get::<i64>(6).unwrap_or(0),
+            preferred_model: row.get::<String>(7).unwrap_or_default(),
+            soul_content: row.get::<String>(8).unwrap_or_default(),
+            binary_path: row.get::<String>(9).unwrap_or_default(),
+            version: row.get::<String>(10).unwrap_or_default(),
+            first_registered_at: row.get::<String>(11).unwrap_or_default(),
+            registration_count: row.get::<i64>(12).unwrap_or(0),
+            crash_count: row.get::<i64>(13).unwrap_or(0),
+            socket_id: row.get::<String>(14).unwrap_or_default(),
+        })),
+        None => Ok(None),
+    }
+}
+
+/// Get the current status of an agent by agent_id (for history tracking).
+pub async fn get_agent_status(db: &Database, agent_id: &str) -> Result<String> {
+    let conn = db_connect(db).await?;
+    let mut rows = conn
+        .query(
+            "SELECT status FROM agent_status WHERE agent_id = ?1",
+            libsql::params![agent_id],
+        )
+        .await
+        .context("get agent status")?;
+    match rows.next().await.context("read row")? {
+        Some(row) => Ok(row.get::<String>(0).unwrap_or_default()),
+        None => Ok(String::new()),
+    }
 }
 
 /// Set the preferred model for an agent.
@@ -1240,4 +1376,302 @@ pub async fn list_pipeline_runs(
     }
 
     Ok(runs)
+}
+
+// ─── Agent history ──────────────────────────────────────────────────────────
+
+/// Row returned from agent_history queries.
+#[derive(Debug, Clone)]
+pub struct AgentHistoryRow {
+    pub id: String,
+    pub agent_id: String,
+    pub prev_status: String,
+    pub new_status: String,
+    pub trigger: String,
+    pub detail: String,
+    pub pid: i64,
+    pub created_at: String,
+}
+
+/// Record an agent state transition.
+pub async fn create_agent_history(
+    db: &Database,
+    agent_id: &str,
+    prev_status: &str,
+    new_status: &str,
+    trigger: &str,
+    detail: &str,
+    pid: u32,
+) -> Result<()> {
+    let conn = db_connect(db).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO agent_history (id, agent_id, prev_status, new_status, trigger, detail, pid, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        libsql::params![id.as_str(), agent_id, prev_status, new_status, trigger, detail, pid as i64, now.as_str()],
+    )
+    .await
+    .context("insert agent_history")?;
+
+    Ok(())
+}
+
+/// List history entries for a specific agent, newest first.
+pub async fn list_agent_history(
+    db: &Database,
+    agent_id: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<AgentHistoryRow>> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT id, agent_id, prev_status, new_status, trigger, detail, pid, created_at
+             FROM agent_history WHERE agent_id = ?1
+             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+            libsql::params![agent_id, i64::from(limit), i64::from(offset)],
+        )
+        .await
+        .context("list agent history")?;
+
+    let mut history = Vec::new();
+    while let Some(row) = rows.next().await.context("read agent_history row")? {
+        history.push(AgentHistoryRow {
+            id: row.get::<String>(0).context("read id")?,
+            agent_id: row.get::<String>(1).context("read agent_id")?,
+            prev_status: row.get::<String>(2).unwrap_or_default(),
+            new_status: row.get::<String>(3).context("read new_status")?,
+            trigger: row.get::<String>(4).unwrap_or_default(),
+            detail: row.get::<String>(5).unwrap_or_default(),
+            pid: row.get::<i64>(6).unwrap_or(0),
+            created_at: row.get::<String>(7).context("read created_at")?,
+        });
+    }
+
+    Ok(history)
+}
+
+/// Count total history entries for an agent (for pagination).
+pub async fn count_agent_history(db: &Database, agent_id: &str) -> Result<u32> {
+    let conn = db_connect(db).await?;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM agent_history WHERE agent_id = ?1",
+            libsql::params![agent_id],
+        )
+        .await
+        .context("count agent history")?;
+    match rows.next().await.context("read count")? {
+        Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) as u32),
+        None => Ok(0),
+    }
+}
+
+/// Delete agent history entries older than the given RFC 3339 timestamp.
+pub async fn purge_agent_history_before(db: &Database, before: &str) -> Result<u64> {
+    let conn = db_connect(db).await?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM agent_history WHERE created_at < ?1",
+            libsql::params![before],
+        )
+        .await
+        .context("purge agent history")?;
+    Ok(deleted)
+}
+
+/// Increment the crash count for agents matching a role hint.
+pub async fn increment_crash_count_by_role(db: &Database, role_hint: &str) -> Result<()> {
+    let conn = db_connect(db).await?;
+    conn.execute(
+        "UPDATE agent_status SET crash_count = crash_count + 1
+         WHERE role LIKE '%' || ?1 || '%'",
+        libsql::params![role_hint],
+    )
+    .await
+    .context("increment crash count")?;
+    Ok(())
+}
+
+// ─── Socket event log ───────────────────────────────────────────────────────
+
+/// Maximum payload size stored in socket_events (4 KB).
+const MAX_EVENT_PAYLOAD_SIZE: usize = 4096;
+
+/// Row returned from socket_events queries.
+#[derive(Debug, Clone)]
+pub struct SocketEventRow {
+    pub id: String,
+    pub event_name: String,
+    pub direction: String,
+    pub agent_id: String,
+    pub socket_id: String,
+    pub room: String,
+    pub payload: String,
+    pub created_at: String,
+}
+
+/// Insert a socket event log entry. Payload is truncated to MAX_EVENT_PAYLOAD_SIZE.
+pub async fn log_socket_event(
+    db: &Database,
+    event_name: &str,
+    direction: &str,
+    agent_id: &str,
+    socket_id: &str,
+    room: &str,
+    payload: &str,
+) -> Result<()> {
+    let conn = db_connect(db).await?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let truncated = if payload.len() > MAX_EVENT_PAYLOAD_SIZE {
+        format!("{}...[truncated]", &payload[..MAX_EVENT_PAYLOAD_SIZE])
+    } else {
+        payload.to_string()
+    };
+
+    conn.execute(
+        "INSERT INTO socket_events (id, event_name, direction, agent_id, socket_id, room, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        libsql::params![id.as_str(), event_name, direction, agent_id, socket_id, room, truncated.as_str(), now.as_str()],
+    )
+    .await
+    .context("insert socket_event")?;
+
+    Ok(())
+}
+
+/// Query socket events with optional filters.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_socket_events(
+    db: &Database,
+    limit: u32,
+    offset: u32,
+    agent_id: Option<&str>,
+    event_name: Option<&str>,
+    direction: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<Vec<SocketEventRow>> {
+    let conn = db_connect(db).await?;
+
+    let mut sql = String::from(
+        "SELECT id, event_name, direction, agent_id, socket_id, room, payload, created_at
+         FROM socket_events WHERE 1=1",
+    );
+    let mut param_values: Vec<libsql::Value> = Vec::new();
+
+    if let Some(aid) = agent_id {
+        param_values.push(libsql::Value::Text(aid.to_string()));
+        sql.push_str(&format!(" AND agent_id = ?{}", param_values.len()));
+    }
+    if let Some(ev) = event_name {
+        param_values.push(libsql::Value::Text(ev.to_string()));
+        sql.push_str(&format!(" AND event_name = ?{}", param_values.len()));
+    }
+    if let Some(dir) = direction {
+        param_values.push(libsql::Value::Text(dir.to_string()));
+        sql.push_str(&format!(" AND direction = ?{}", param_values.len()));
+    }
+    if let Some(s) = since {
+        param_values.push(libsql::Value::Text(s.to_string()));
+        sql.push_str(&format!(" AND created_at >= ?{}", param_values.len()));
+    }
+    if let Some(u) = until {
+        param_values.push(libsql::Value::Text(u.to_string()));
+        sql.push_str(&format!(" AND created_at <= ?{}", param_values.len()));
+    }
+
+    param_values.push(libsql::Value::Integer(i64::from(limit)));
+    let limit_idx = param_values.len();
+    param_values.push(libsql::Value::Integer(i64::from(offset)));
+    let offset_idx = param_values.len();
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+        limit_idx, offset_idx
+    ));
+
+    let mut rows = conn
+        .query(&sql, param_values)
+        .await
+        .context("list socket events")?;
+    let mut events = Vec::new();
+
+    while let Some(row) = rows.next().await.context("read socket_event row")? {
+        events.push(SocketEventRow {
+            id: row.get::<String>(0).context("read id")?,
+            event_name: row.get::<String>(1).context("read event_name")?,
+            direction: row.get::<String>(2).unwrap_or_default(),
+            agent_id: row.get::<String>(3).unwrap_or_default(),
+            socket_id: row.get::<String>(4).unwrap_or_default(),
+            room: row.get::<String>(5).unwrap_or_default(),
+            payload: row.get::<String>(6).unwrap_or_default(),
+            created_at: row.get::<String>(7).context("read created_at")?,
+        });
+    }
+
+    Ok(events)
+}
+
+/// Count matching socket events (for pagination).
+#[allow(clippy::too_many_arguments)]
+pub async fn count_socket_events(
+    db: &Database,
+    agent_id: Option<&str>,
+    event_name: Option<&str>,
+    direction: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<u32> {
+    let conn = db_connect(db).await?;
+
+    let mut sql = String::from("SELECT COUNT(*) FROM socket_events WHERE 1=1");
+    let mut param_values: Vec<libsql::Value> = Vec::new();
+
+    if let Some(aid) = agent_id {
+        param_values.push(libsql::Value::Text(aid.to_string()));
+        sql.push_str(&format!(" AND agent_id = ?{}", param_values.len()));
+    }
+    if let Some(ev) = event_name {
+        param_values.push(libsql::Value::Text(ev.to_string()));
+        sql.push_str(&format!(" AND event_name = ?{}", param_values.len()));
+    }
+    if let Some(dir) = direction {
+        param_values.push(libsql::Value::Text(dir.to_string()));
+        sql.push_str(&format!(" AND direction = ?{}", param_values.len()));
+    }
+    if let Some(s) = since {
+        param_values.push(libsql::Value::Text(s.to_string()));
+        sql.push_str(&format!(" AND created_at >= ?{}", param_values.len()));
+    }
+    if let Some(u) = until {
+        param_values.push(libsql::Value::Text(u.to_string()));
+        sql.push_str(&format!(" AND created_at <= ?{}", param_values.len()));
+    }
+
+    let mut rows = conn
+        .query(&sql, param_values)
+        .await
+        .context("count socket events")?;
+    match rows.next().await.context("read count")? {
+        Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) as u32),
+        None => Ok(0),
+    }
+}
+
+/// Delete socket events older than the given RFC 3339 timestamp.
+pub async fn purge_socket_events_before(db: &Database, before: &str) -> Result<u64> {
+    let conn = db_connect(db).await?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM socket_events WHERE created_at < ?1",
+            libsql::params![before],
+        )
+        .await
+        .context("purge socket events")?;
+    Ok(deleted)
 }

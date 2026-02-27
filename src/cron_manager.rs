@@ -16,6 +16,8 @@ use crate::task_db;
 pub mod names {
     pub const DAILY_UPDATE_CHECK: &str = "daily_update_check";
     pub const GATEWAY_HEALTH_CHECK: &str = "gateway_health_check";
+    pub const PURGE_SOCKET_EVENTS: &str = "purge_socket_events";
+    pub const PURGE_AGENT_HISTORY: &str = "purge_agent_history";
 }
 
 /// (name, schedule_str, poll_interval) — schedule_str is stored in the DB,
@@ -30,6 +32,16 @@ const SYSTEM_CRONS: &[(&str, &str, Duration)] = &[
         names::GATEWAY_HEALTH_CHECK,
         "0 * * * *",
         Duration::from_secs(60 * 60),
+    ),
+    (
+        names::PURGE_SOCKET_EVENTS,
+        "0 3 * * *",
+        Duration::from_secs(24 * 60 * 60),
+    ),
+    (
+        names::PURGE_AGENT_HISTORY,
+        "0 3 * * *",
+        Duration::from_secs(24 * 60 * 60),
     ),
 ];
 
@@ -119,6 +131,8 @@ async fn dispatch_cron_job(name: &str, db: &Database, io: &SocketIo) -> Result<(
     match name {
         names::DAILY_UPDATE_CHECK => dispatch_update_check(db, io).await,
         names::GATEWAY_HEALTH_CHECK => dispatch_gateway_health(db, io).await,
+        names::PURGE_SOCKET_EVENTS => dispatch_purge_socket_events(db).await,
+        names::PURGE_AGENT_HISTORY => dispatch_purge_agent_history(db).await,
         other => {
             warn!(name = %other, "unknown cron job name — no-op");
             Ok(())
@@ -168,6 +182,24 @@ async fn dispatch_gateway_health(_db: &Database, io: &SocketIo) -> Result<()> {
     }
 
     info!("dispatched gateway health check broadcast via cron");
+    Ok(())
+}
+
+/// Purge socket_events older than 7 days.
+async fn dispatch_purge_socket_events(db: &Database) -> Result<()> {
+    let seven_days = chrono::TimeDelta::try_days(7).unwrap_or(chrono::TimeDelta::zero());
+    let cutoff = (chrono::Utc::now() - seven_days).to_rfc3339();
+    let deleted = task_db::purge_socket_events_before(db, &cutoff).await?;
+    info!(deleted, cutoff = %cutoff, "purged old socket events");
+    Ok(())
+}
+
+/// Purge agent_history older than 30 days.
+async fn dispatch_purge_agent_history(db: &Database) -> Result<()> {
+    let thirty_days = chrono::TimeDelta::try_days(30).unwrap_or(chrono::TimeDelta::zero());
+    let cutoff = (chrono::Utc::now() - thirty_days).to_rfc3339();
+    let deleted = task_db::purge_agent_history_before(db, &cutoff).await?;
+    info!(deleted, cutoff = %cutoff, "purged old agent history");
     Ok(())
 }
 

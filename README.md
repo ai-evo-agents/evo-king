@@ -48,7 +48,8 @@ Central orchestrator for the Evo self-evolution agent system. Manages gateway co
                     │  │  agent_status, config_history, │      │
                     │  │  cron_jobs, task_logs,          │      │
                     │  │  memories, memory_tiers,        │      │
-                    │  │  task_memories                  │      │
+                    │  │  task_memories, agent_history,  │      │
+                    │  │  socket_events                  │      │
                     │  └───────────────────────────────┘      │
                     └─────────────────────┬───────────────────┘
                                           │ socket.io
@@ -82,10 +83,11 @@ At startup, king automatically discovers and spawns all kernel agents:
 2. Spawns an `evo-runner` process for each discovered agent, passing the agent folder as argument and `KING_ADDRESS` as an environment variable.
 3. Each runner connects back to king via Socket.IO and sends an `agent:register` event with its identity, capabilities, and loaded skills.
 4. King joins the agent to the `kernel` room and a role-specific room (e.g. `role:learning`) for targeted pipeline dispatch.
-5. King persists the full agent metadata (role, capabilities, skills, PID) to the `agent_status` database table.
-6. A background monitor watches for crashed runner processes and updates their status in the database.
+5. King persists the full agent metadata (role, capabilities, skills, PID, soul content, version, binary path) to the `agent_status` database table. Registration count auto-increments on each re-register.
+6. A background monitor watches for crashed runner processes, increments crash counts, and records state transitions in the `agent_history` table.
+7. On disconnect, king records a history entry tracking the transition from the agent's current status to "disconnected".
 
-Registered agents can be queried via the `GET /agents` HTTP endpoint.
+Registered agents can be queried via the `GET /agents` HTTP endpoint. Full agent detail (including soul content and recent history) is available at `GET /agents/{agent_id}/detail`.
 
 ---
 
@@ -135,11 +137,18 @@ CREATE TABLE pipeline_runs (
 
 -- Agent status + heartbeat tracking
 CREATE TABLE agent_status (
-    agent_id        TEXT PRIMARY KEY,
-    role            TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'offline',
-    last_heartbeat  TEXT NOT NULL,
-    preferred_model TEXT NOT NULL DEFAULT ''
+    agent_id            TEXT PRIMARY KEY,
+    role                TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'offline',
+    last_heartbeat      TEXT NOT NULL,
+    preferred_model     TEXT NOT NULL DEFAULT '',
+    soul_content        TEXT NOT NULL DEFAULT '',
+    binary_path         TEXT NOT NULL DEFAULT '',
+    version             TEXT NOT NULL DEFAULT '',
+    first_registered_at TEXT NOT NULL DEFAULT '',
+    registration_count  INTEGER NOT NULL DEFAULT 0,
+    crash_count         INTEGER NOT NULL DEFAULT 0,
+    socket_id           TEXT NOT NULL DEFAULT ''
 );
 
 -- Gateway config change audit trail
@@ -224,6 +233,38 @@ CREATE TABLE task_memories (
 
 **Indexes:** `memories.scope`, `memories.category`, `memories.agent_id`, `memory_tiers.memory_id`, `task_memories.task_id`, `task_memories.memory_id`.
 
+### Observability Tables
+
+```sql
+-- Agent state transition history (online → crashed → respawned, etc.)
+CREATE TABLE agent_history (
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL,
+    prev_status TEXT NOT NULL DEFAULT '',
+    new_status  TEXT NOT NULL,
+    trigger     TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT '',
+    pid         INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+-- Socket.IO event audit log (fire-and-forget, payloads truncated to 4KB)
+CREATE TABLE socket_events (
+    id          TEXT PRIMARY KEY,
+    event_name  TEXT NOT NULL,
+    direction   TEXT NOT NULL DEFAULT 'inbound',
+    agent_id    TEXT NOT NULL DEFAULT '',
+    socket_id   TEXT NOT NULL DEFAULT '',
+    room        TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL
+);
+```
+
+**Indexes:** `agent_history.agent_id`, `agent_history.created_at`, `socket_events.agent_id`, `socket_events.event_name`, `socket_events.created_at`.
+
+**Retention:** Daily cron jobs purge `socket_events` older than 7 days and `agent_history` older than 30 days.
+
 ---
 
 ## Pipeline Coordinator
@@ -274,7 +315,7 @@ src/
   gateway_manager.rs       Config lifecycle: test -> health check -> swap -> backup or revert
   agent_manager.rs         Discover evo-kernel-agent-* repos, spawn/stop/monitor runner processes
   pipeline_coordinator.rs  Pipeline state machine: start/advance/timeout pipeline runs
-  cron_manager.rs          System cron job scheduling (update checks, gateway health)
+  cron_manager.rs          System cron job scheduling (update checks, gateway health, retention purge)
   doctor.rs                Installation validation and repair (evo-king doctor subcommand)
 ```
 
@@ -427,6 +468,15 @@ All evo binaries support `--version` / `-V` to print their name and version.
 |--------|------|-------------|
 | `GET` | `/agents/{agent_id}/model` | Get an agent's preferred model |
 | `PUT` | `/agents/{agent_id}/model` | Set an agent's preferred model (`{"model": "..."}`) |
+| `GET` | `/agents/{agent_id}/history` | Agent state transition log (query: `limit`, `offset`) |
+| `GET` | `/agents/{agent_id}/detail` | Full agent info + last 20 history entries |
+
+### Logs & Observability
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/logs/events` | Socket.IO event audit log (query: `agent_id`, `event_name`, `direction`, `since`, `until`, `limit`, `offset`) |
+| `GET` | `/logs/system` | Tail a component's log file (query: `lines`, `component`) |
 
 ### Gateway & Config
 

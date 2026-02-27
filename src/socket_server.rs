@@ -1,11 +1,47 @@
 use crate::{memory_db, state::KingState, task_db};
 use evo_common::messages::{AgentRole, PipelineStage, events};
+use libsql::Database;
 use socketioxide::SocketIo;
 use socketioxide::extract::{AckSender, Data, SocketRef};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 const MAX_TASK_LIMIT: u64 = 500;
+
+/// Fire-and-forget socket event logging.
+/// Spawns a tokio task to avoid blocking the Socket.IO event handler.
+fn log_event(
+    db: &Arc<Database>,
+    event_name: &str,
+    direction: &str,
+    agent_id: &str,
+    socket_id: &str,
+    room: &str,
+    payload: &serde_json::Value,
+) {
+    let db = Arc::clone(db);
+    let event_name = event_name.to_string();
+    let direction = direction.to_string();
+    let agent_id = agent_id.to_string();
+    let socket_id = socket_id.to_string();
+    let room = room.to_string();
+    let payload_str = payload.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = task_db::log_socket_event(
+            &db,
+            &event_name,
+            &direction,
+            &agent_id,
+            &socket_id,
+            &room,
+            &payload_str,
+        )
+        .await
+        {
+            warn!(err = %e, event = %event_name, "failed to log socket event");
+        }
+    });
+}
 
 // ─── Handler registration ─────────────────────────────────────────────────────
 
@@ -46,6 +82,9 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         // Task room handler arcs
         let s_task_join = Arc::clone(&state);
         let s_task_summary = Arc::clone(&state);
+
+        // Disconnect handler arc
+        let s_disconnect = Arc::clone(&state);
 
         // dashboard:subscribe — dashboard clients join a read-only room
         socket.on(
@@ -116,6 +155,7 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                         agent_id = %agent_id,
                         "debug:response received, relaying to dashboard"
                     );
+                    log_event(&state.db, events::DEBUG_RESPONSE, "inbound", agent_id, "", "", &data);
                     let _ = state.io.to("dashboard").emit(
                         "dashboard:event",
                         serde_json::json!({ "event": "debug:response", "data": data }),
@@ -259,7 +299,7 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         socket.on(
             events::TASK_JOIN,
             move |s: SocketRef, Data::<serde_json::Value>(data)| {
-                let _state = Arc::clone(&s_task_join);
+                let state = Arc::clone(&s_task_join);
                 let task_id = data["task_id"].as_str().unwrap_or("").to_string();
                 let agent_id = data["agent_id"].as_str().unwrap_or("unknown").to_string();
                 async move {
@@ -270,6 +310,7 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                     let room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
                     let _ = s.join(room.clone());
                     info!(agent_id = %agent_id, task_id = %task_id, room = %room, "agent joined task room");
+                    log_event(&state.db, events::TASK_JOIN, "inbound", &agent_id, "", &room, &data);
                 }
             },
         );
@@ -284,8 +325,28 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         );
 
         socket.on_disconnect(
-            |s: SocketRef, _reason: socketioxide::socket::DisconnectReason| {
-                info!(sid = %s.id, "runner disconnected");
+            move |s: SocketRef, reason: socketioxide::socket::DisconnectReason| {
+                let state = Arc::clone(&s_disconnect);
+                let sid = s.id.to_string();
+                info!(sid = %sid, reason = ?reason, "runner disconnected");
+
+                // Look up agent by socket_id and record disconnect in history
+                tokio::spawn(async move {
+                    if let Ok(agents) = task_db::list_agents(&state.db).await
+                        && let Some(agent) = agents.iter().find(|a| a.socket_id == sid)
+                    {
+                        let _ = task_db::create_agent_history(
+                            &state.db,
+                            &agent.agent_id,
+                            &agent.status,
+                            "disconnected",
+                            "socket_disconnect",
+                            &format!("{reason:?}"),
+                            agent.pid as u32,
+                        )
+                        .await;
+                    }
+                });
             },
         );
     });
@@ -314,6 +375,12 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         .get("skills")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "[]".to_string());
+
+    // Extract enriched metadata (backward-compatible: defaults to empty if absent)
+    let soul_content = data["soul_content"].as_str().unwrap_or("");
+    let version = data["version"].as_str().unwrap_or("");
+    let binary_path = data["binary_path"].as_str().unwrap_or("");
+    let socket_id_str = socket.id.to_string();
 
     info!(
         agent_id     = %agent_id,
@@ -352,6 +419,11 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         .await
         .unwrap_or(0);
 
+    // Query previous status for history tracking (before upsert)
+    let prev_status = task_db::get_agent_status(&state.db, agent_id)
+        .await
+        .unwrap_or_default();
+
     if let Err(e) = task_db::upsert_agent(
         &state.db,
         agent_id,
@@ -360,11 +432,39 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
         Some(&capabilities),
         Some(&skills),
         Some(pid),
+        Some(soul_content).filter(|s| !s.is_empty()),
+        Some(binary_path).filter(|s| !s.is_empty()),
+        Some(version).filter(|s| !s.is_empty()),
+        Some(&socket_id_str),
     )
     .await
     {
         warn!(err = %e, "failed to record agent registration in DB");
     }
+
+    // Record state transition in agent history
+    let prev = if prev_status.is_empty() {
+        "new"
+    } else {
+        &prev_status
+    };
+    if let Err(e) =
+        task_db::create_agent_history(&state.db, agent_id, prev, "online", "register", "", pid)
+            .await
+    {
+        warn!(err = %e, "failed to record agent history");
+    }
+
+    // Log socket event (fire-and-forget)
+    log_event(
+        &state.db,
+        events::AGENT_REGISTER,
+        "inbound",
+        agent_id,
+        &socket_id_str,
+        "",
+        &data,
+    );
 
     // Notify dashboard clients
     let _ = state.io.to("dashboard").emit(
@@ -383,7 +483,11 @@ async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
     };
     let status = data["status"].as_str().unwrap_or("heartbeat");
 
-    if let Err(e) = task_db::upsert_agent(&state.db, agent_id, "", status, None, None, None).await {
+    if let Err(e) = task_db::upsert_agent(
+        &state.db, agent_id, "", status, None, None, None, None, None, None, None,
+    )
+    .await
+    {
         warn!(err = %e, "failed to update agent heartbeat in DB");
     }
 
@@ -399,6 +503,16 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
     let skill_id = data["skill_id"].as_str().unwrap_or("unknown");
 
     info!(agent_id = %agent_id, skill_id = %skill_id, "skill report received");
+
+    log_event(
+        &state.db,
+        events::AGENT_SKILL_REPORT,
+        "inbound",
+        agent_id,
+        "",
+        "",
+        &data,
+    );
 
     if let Err(e) = task_db::create_task(
         &state.db,
@@ -420,6 +534,16 @@ async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
 async fn on_health(data: serde_json::Value, state: Arc<KingState>) {
     let agent_id = data["agent_id"].as_str().unwrap_or("unknown");
     info!(agent_id = %agent_id, "agent health report received");
+
+    log_event(
+        &state.db,
+        events::AGENT_HEALTH,
+        "inbound",
+        agent_id,
+        "",
+        "",
+        &data,
+    );
 
     if let Err(e) = task_db::create_task(
         &state.db,
@@ -480,6 +604,16 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
         agent_id = %agent_id,
         status = %status,
         "pipeline stage result received"
+    );
+
+    log_event(
+        &state.db,
+        events::PIPELINE_STAGE_RESULT,
+        "inbound",
+        agent_id,
+        "",
+        "",
+        &data,
     );
 
     if let Err(e) = state
@@ -564,6 +698,17 @@ async fn on_task_create(
             let response = task_row_to_json(&row);
             info!(task_id = %row.id, task_type = %task_type, "task created");
 
+            let aid = data["agent_id"].as_str().unwrap_or("");
+            log_event(
+                &state.db,
+                events::TASK_CREATE,
+                "inbound",
+                aid,
+                "",
+                "",
+                &data,
+            );
+
             if let Err(e) = ack.send(&serde_json::json!({ "success": true, "task": response })) {
                 warn!(err = %e, "failed to send task:create ack");
             }
@@ -620,6 +765,17 @@ async fn on_task_update(
         Ok(Some(row)) => {
             let response = task_row_to_json(&row);
             info!(task_id = %task_id, "task updated");
+
+            let aid = data["agent_id"].as_str().unwrap_or("");
+            log_event(
+                &state.db,
+                events::TASK_UPDATE,
+                "inbound",
+                aid,
+                "",
+                "",
+                &data,
+            );
 
             if let Err(e) = ack.send(&serde_json::json!({ "success": true, "task": response })) {
                 warn!(err = %e, "failed to send task:update ack");
@@ -718,6 +874,7 @@ async fn on_task_delete(
     match task_db::delete_task(&state.db, task_id).await {
         Ok(true) => {
             info!(task_id = %task_id, "task deleted");
+            log_event(&state.db, events::TASK_DELETE, "inbound", "", "", "", &data);
             let _ = ack.send(&serde_json::json!({ "success": true, "task_id": task_id }));
 
             let broadcast = serde_json::json!({ "action": "deleted", "task_id": task_id });
@@ -798,6 +955,15 @@ async fn on_memory_store(
             }
 
             info!(memory_id = %row.id, scope = %scope, category = %category, "memory stored");
+            log_event(
+                &state.db,
+                events::MEMORY_STORE,
+                "inbound",
+                agent_id,
+                "",
+                "",
+                &data,
+            );
             let _ = ack.send(&serde_json::json!({ "success": true, "memory_id": row.id }));
 
             let broadcast = serde_json::json!({ "action": "created", "memory_id": row.id });
@@ -941,6 +1107,15 @@ async fn on_memory_update(
             }
 
             info!(memory_id = %memory_id, "memory updated");
+            log_event(
+                &state.db,
+                events::MEMORY_UPDATE,
+                "inbound",
+                "",
+                "",
+                "",
+                &data,
+            );
             let _ = ack
                 .send(&serde_json::json!({ "success": true, "memory": memory_row_to_json(&row) }));
 
@@ -980,6 +1155,15 @@ async fn on_memory_delete(
     match memory_db::delete_memory(&state.db, memory_id).await {
         Ok(true) => {
             info!(memory_id = %memory_id, "memory deleted");
+            log_event(
+                &state.db,
+                events::MEMORY_DELETE,
+                "inbound",
+                "",
+                "",
+                "",
+                &data,
+            );
             let _ = ack.send(&serde_json::json!({ "success": true, "memory_id": memory_id }));
 
             let broadcast = serde_json::json!({ "action": "deleted", "memory_id": memory_id });
@@ -1033,6 +1217,16 @@ async fn on_task_summary(
         agent_id = %agent_id,
         score = %score,
         "task:summary received"
+    );
+
+    log_event(
+        &state.db,
+        events::TASK_SUMMARY,
+        "inbound",
+        agent_id,
+        "",
+        "",
+        &data,
     );
 
     // 1. Update task summary in DB

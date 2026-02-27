@@ -342,6 +342,19 @@ pub async fn monitor_processes(
                 info!(agent = %key, "agent marked as crashed in DB — attempting respawn");
             }
 
+            // Increment crash count and record state transition
+            let _ = task_db::increment_crash_count_by_role(&db, &key).await;
+            let _ = task_db::create_agent_history(
+                &db,
+                &key,
+                "online",
+                "crashed",
+                "process_exit",
+                "",
+                0,
+            )
+            .await;
+
             let mut respawned = false;
 
             for attempt in 1..=MAX_RESPAWN_ATTEMPTS {
@@ -363,6 +376,16 @@ pub async fn monitor_processes(
                                 },
                             )
                             .await;
+                        let _ = task_db::create_agent_history(
+                            &db,
+                            &key,
+                            "crashed",
+                            "respawning",
+                            "respawn_success",
+                            "",
+                            pid,
+                        )
+                        .await;
                         respawned = true;
                         break;
                     }
@@ -378,6 +401,16 @@ pub async fn monitor_processes(
                 if let Err(e) = task_db::mark_agent_failed_by_role(&db, &key, &err_msg).await {
                     error!(agent = %key, err = %e, "failed to mark agent as failed in DB");
                 }
+                let _ = task_db::create_agent_history(
+                    &db,
+                    &key,
+                    "crashed",
+                    "failed",
+                    "respawn_exhausted",
+                    &err_msg,
+                    0,
+                )
+                .await;
             }
         }
     }
@@ -446,6 +479,17 @@ pub async fn heartbeat_watch_loop(
                         threshold = HEARTBEAT_SILENCE_THRESHOLD_SECS,
                         "kernel agent has not sent heartbeat — checking process"
                     );
+
+                    let _ = task_db::create_agent_history(
+                        &db,
+                        &agent.agent_id,
+                        &agent.status,
+                        "silent",
+                        "heartbeat_timeout",
+                        &format!("no heartbeat for {elapsed_secs}s"),
+                        agent.pid as u32,
+                    )
+                    .await;
 
                     // If the process is already in the registry it might just be slow
                     if registry.pid_by_folder_hint(role).await.is_some() {
