@@ -10,6 +10,9 @@ mod socket_server;
 mod state;
 mod system_discovery;
 mod task_db;
+mod trace_api;
+mod trace_db;
+mod trace_receiver;
 
 use agent_manager::AgentRegistry;
 use anyhow::{Context, Result};
@@ -19,7 +22,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::{Parser, Subcommand};
-use evo_common::logging::init_logging;
+use evo_common::logging::init_logging_with_otel;
 use pipeline_coordinator::PipelineCoordinator;
 use serde::Deserialize;
 use serde_json::json;
@@ -61,8 +64,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Structured JSON logging to logs/king.log (+ stdout)
-    let _log_guard = init_logging("king");
+    // Structured JSON logging to logs/king.log (+ stdout) with OpenTelemetry
+    let otlp_endpoint =
+        std::env::var("EVO_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:3300".to_string());
+    let (_log_guard, _otel_guard) = init_logging_with_otel("king", &otlp_endpoint);
 
     let cli = Cli::parse();
 
@@ -175,6 +180,13 @@ async fn main() -> Result<()> {
         .route("/task/current", get(task_current_handler))
         .route("/task/{task_id}/logs", get(task_logs_handler))
         .route("/task/{task_id}/subtasks", get(task_subtasks_handler))
+        // ── Tracing endpoints ──────────────────────────────────────────────
+        .route(
+            "/v1/traces",
+            axum::routing::post(trace_receiver::otlp_traces_receiver),
+        )
+        .route("/traces", get(trace_api::traces_list_handler))
+        .route("/traces/{trace_id}", get(trace_api::trace_detail_handler))
         // ── Debug endpoints ─────────────────────────────────────────────────
         .route("/debug/prompt", post(debug_prompt_handler))
         .route("/debug/bash", post(debug_bash_handler))

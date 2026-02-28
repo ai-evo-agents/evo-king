@@ -234,6 +234,48 @@ CREATE TABLE task_memories (
 
 **Indexes:** `memories.scope`, `memories.category`, `memories.agent_id`, `memory_tiers.memory_id`, `task_memories.task_id`, `task_memories.memory_id`.
 
+### Distributed Tracing Tables
+
+```sql
+-- Aggregated trace envelope (one row per trace_id)
+CREATE TABLE traces (
+    trace_id        TEXT PRIMARY KEY,
+    service_name    TEXT NOT NULL DEFAULT '',
+    root_span_name  TEXT NOT NULL DEFAULT '',
+    start_time_ns   INTEGER NOT NULL DEFAULT 0,
+    end_time_ns     INTEGER NOT NULL DEFAULT 0,
+    duration_ns     INTEGER NOT NULL DEFAULT 0,
+    status_code     INTEGER NOT NULL DEFAULT 0,  -- 0=unset, 1=ok, 2=error
+    span_count      INTEGER NOT NULL DEFAULT 0,
+    resource        TEXT NOT NULL DEFAULT '{}',
+    updated_at      TEXT NOT NULL DEFAULT ''
+);
+
+-- Individual spans within a trace
+CREATE TABLE spans (
+    span_id         TEXT NOT NULL,
+    trace_id        TEXT NOT NULL,
+    parent_span_id  TEXT NOT NULL DEFAULT '',
+    name            TEXT NOT NULL DEFAULT '',
+    kind            INTEGER NOT NULL DEFAULT 0,
+    service_name    TEXT NOT NULL DEFAULT '',
+    start_time_ns   INTEGER NOT NULL DEFAULT 0,
+    end_time_ns     INTEGER NOT NULL DEFAULT 0,
+    duration_ns     INTEGER NOT NULL DEFAULT 0,
+    status_code     INTEGER NOT NULL DEFAULT 0,
+    status_message  TEXT NOT NULL DEFAULT '',
+    attributes      TEXT NOT NULL DEFAULT '[]',
+    events          TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (trace_id, span_id)
+);
+```
+
+**Indexes:** `traces.start_time_ns`, `traces.service_name`, `traces.status_code`, `traces.duration_ns`, `spans.trace_id`, `spans.parent_span_id`.
+
+King acts as a **self-contained OTLP receiver** — all components export spans to `POST /v1/traces` and the dashboard displays them via `GET /traces`.
+
+---
+
 ### Observability Tables
 
 ```sql
@@ -334,6 +376,9 @@ src/
   error.rs                 Error types
   task_db.rs               Turso/libSQL database management (schema, CRUD for all tables)
   memory_db.rs             Memory CRUD: create, get, update, delete, search, tiers, stats
+  trace_db.rs              Trace storage: store OTLP spans, list traces, get trace detail
+  trace_receiver.rs        OTLP HTTP receiver (POST /v1/traces) — accepts protobuf or JSON
+  trace_api.rs             Trace REST API (GET /traces, GET /traces/:id) for the dashboard
   socket_server.rs         socketioxide event handlers for all Socket.IO events
   config_watcher.rs        Watch gateway.config via notify crate, emit change events internally
   gateway_manager.rs       Config lifecycle: test -> health check -> swap -> backup or revert
@@ -366,7 +411,9 @@ thiserror = "2.0"
 reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 uuid = { version = "1.0", features = ["v4"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
-evo-common = { path = "../evo-common" }
+evo-common = { path = "../evo-common", features = ["tracing-otel"] }
+opentelemetry-proto = { version = "0.31", features = ["trace", "gen-tonic-messages"] }
+prost = "0.14"
 portable-pty = "0.8"
 ```
 
@@ -438,6 +485,7 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | `RUNNER_BINARY` | Path to the evo-runner binary | `../evo-agents/target/release/evo-runner` |
 | `EVO_LOG_DIR` | Log output directory | `./logs` |
 | `RUST_LOG` | Log level filter | `info` |
+| `EVO_OTLP_ENDPOINT` | OTLP HTTP endpoint for span export | `http://localhost:3300` (self) |
 
 ---
 
@@ -496,6 +544,14 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | `PUT` | `/agents/{agent_id}/model` | Set an agent's preferred model (`{"model": "..."}`) |
 | `GET` | `/agents/{agent_id}/history` | Agent state transition log (query: `limit`, `offset`) |
 | `GET` | `/agents/{agent_id}/detail` | Full agent info + last 20 history entries |
+
+### Distributed Tracing
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/traces` | OTLP HTTP receiver — accepts `application/x-protobuf` or `application/json` |
+| `GET` | `/traces` | List traces (query: `service`, `status`, `min_duration_ms`, `limit`, `offset`) |
+| `GET` | `/traces/:trace_id` | Trace detail: metadata + all spans ordered by start time |
 
 ### Logs & Observability
 

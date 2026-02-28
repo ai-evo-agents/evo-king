@@ -244,6 +244,58 @@ pub async fn init_db(path: &str) -> Result<Database> {
     .await
     .context("create agent_history + socket_events indexes")?;
 
+    // ── OpenTelemetry trace storage ─────────────────────────────────────────
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS traces (
+            trace_id        TEXT PRIMARY KEY,
+            service_name    TEXT NOT NULL DEFAULT '',
+            root_span_name  TEXT NOT NULL DEFAULT '',
+            start_time_ns   INTEGER NOT NULL DEFAULT 0,
+            end_time_ns     INTEGER NOT NULL DEFAULT 0,
+            duration_ns     INTEGER NOT NULL DEFAULT 0,
+            status_code     INTEGER NOT NULL DEFAULT 0,
+            span_count      INTEGER NOT NULL DEFAULT 0,
+            resource        TEXT NOT NULL DEFAULT '{}',
+            updated_at      TEXT NOT NULL DEFAULT ''
+        )",
+        (),
+    )
+    .await
+    .context("create traces table")?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS spans (
+            span_id         TEXT NOT NULL,
+            trace_id        TEXT NOT NULL,
+            parent_span_id  TEXT NOT NULL DEFAULT '',
+            name            TEXT NOT NULL DEFAULT '',
+            kind            INTEGER NOT NULL DEFAULT 0,
+            service_name    TEXT NOT NULL DEFAULT '',
+            start_time_ns   INTEGER NOT NULL DEFAULT 0,
+            end_time_ns     INTEGER NOT NULL DEFAULT 0,
+            duration_ns     INTEGER NOT NULL DEFAULT 0,
+            status_code     INTEGER NOT NULL DEFAULT 0,
+            status_message  TEXT NOT NULL DEFAULT '',
+            attributes      TEXT NOT NULL DEFAULT '{}',
+            events          TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (trace_id, span_id)
+        )",
+        (),
+    )
+    .await
+    .context("create spans table")?;
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_traces_start_time ON traces(start_time_ns DESC);
+         CREATE INDEX IF NOT EXISTS idx_traces_service ON traces(service_name);
+         CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(status_code);
+         CREATE INDEX IF NOT EXISTS idx_traces_duration ON traces(duration_ns DESC);
+         CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id);
+         CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id);",
+    )
+    .await
+    .context("create trace indexes")?;
+
     // ── Schema migrations ────────────────────────────────────────────────────
     // Add new columns to agent_status for enhanced metadata persistence.
     // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch the

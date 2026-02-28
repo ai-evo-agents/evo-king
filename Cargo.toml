@@ -25,5 +25,8 @@ thiserror     = "2.0"
 reqwest       = { version = "0.12", features = ["json", "native-tls-vendored"] }
 uuid          = { version = "1.0", features = ["v4"] }
 tower-http    = { version = "0.6", features = ["cors", "fs"] }
-evo-common    = { path = "../evo-common" }
+evo-common    = { path = "../evo-common", features = ["tracing-otel"] }
 portable-pty  = "0.8"
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["trace", "gen-tonic-messages", "with-serde"] }
+prost         = "0.14"
+hex           = "0.4"
