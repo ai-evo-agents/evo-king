@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
             get(gateway_config_get_handler).put(gateway_config_put_handler),
         )
         .route("/config-history", get(config_history_handler))
-        .route("/tasks", get(tasks_list_handler))
+        .route("/tasks", get(tasks_list_handler).post(task_create_handler))
         .route("/task/current", get(task_current_handler))
         .route("/task/{task_id}/logs", get(task_logs_handler))
         .route("/task/{task_id}/subtasks", get(task_subtasks_handler))
@@ -1182,6 +1182,43 @@ async fn tasks_list_handler(
             Json(json!({ "tasks": tasks, "count": count }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Request body for POST /tasks.
+#[derive(Deserialize)]
+struct TaskCreateBody {
+    task_type: Option<String>,
+    summary: Option<String>,
+    payload: Option<String>,
+}
+
+/// POST /tasks — create a new task manually.
+async fn task_create_handler(
+    State(state): State<Arc<KingState>>,
+    Json(body): Json<TaskCreateBody>,
+) -> Json<serde_json::Value> {
+    let task_type = body.task_type.as_deref().unwrap_or("manual");
+    let summary = body.summary.as_deref().unwrap_or("");
+    let payload = body.payload.as_deref().unwrap_or("{}");
+
+    match task_db::create_task(
+        &state.db, task_type, "pending", None, payload, "", "", summary, "",
+    )
+    .await
+    {
+        Ok(task) => {
+            let task_json = task_row_to_json_http(&task);
+            let _ = state.io.to("dashboard").emit(
+                "dashboard:event",
+                serde_json::json!({
+                    "event": "task:created",
+                    "data": { "task": task_json }
+                }),
+            );
+            Json(json!({ "success": true, "task": task_row_to_json_http(&task) }))
+        }
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
     }
 }
 

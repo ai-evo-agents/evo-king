@@ -513,6 +513,7 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/tasks` | List tasks (query: `limit`, `status`, `agent_id`) |
+| `POST` | `/tasks` | Create a new task manually (`{"task_type", "summary", "payload"}`) |
 | `GET` | `/task/current` | Get the current active task |
 | `GET` | `/task/:task_id/logs` | Logs for a specific task |
 | `GET` | `/task/:task_id/subtasks` | Subtasks for a specific task |
