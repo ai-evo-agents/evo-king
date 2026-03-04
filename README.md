@@ -143,6 +143,7 @@ CREATE TABLE agent_status (
     status              TEXT NOT NULL DEFAULT 'offline',
     last_heartbeat      TEXT NOT NULL,
     preferred_model     TEXT NOT NULL DEFAULT '',
+    reasoning_effort    TEXT NOT NULL DEFAULT '',
     soul_content        TEXT NOT NULL DEFAULT '',
     binary_path         TEXT NOT NULL DEFAULT '',
     version             TEXT NOT NULL DEFAULT '',
@@ -394,8 +395,8 @@ src/
 
 ```toml
 [dependencies]
-axum = "0.7"
-socketioxide = "0.14"
+axum = "0.8"
+socketioxide = "0.18"
 tokio = { version = "1", features = ["full"] }
 notify = "8"
 libsql = "0.6"
@@ -542,7 +543,7 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/agents/{agent_id}/model` | Get an agent's preferred model |
-| `PUT` | `/agents/{agent_id}/model` | Set an agent's preferred model (`{"model": "..."}`) |
+| `PUT` | `/agents/{agent_id}/model` | Set an agent's preferred model and reasoning effort (`{"model": "...", "reasoning_effort": "high"}`) |
 | `GET` | `/agents/{agent_id}/history` | Agent state transition log (query: `limit`, `offset`) |
 | `GET` | `/agents/{agent_id}/detail` | Full agent info + last 20 history entries |
 

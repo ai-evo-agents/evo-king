@@ -159,7 +159,11 @@ async fn dispatch_update_check(db: &Database, io: &SocketIo) -> Result<()> {
         }
     });
 
-    if let Err(e) = io.to(room.clone()).emit(events::PIPELINE_NEXT, &payload) {
+    if let Err(e) = io
+        .to(room.clone())
+        .emit(events::PIPELINE_NEXT, &payload)
+        .await
+    {
         anyhow::bail!("failed to emit pipeline:next to {room}: {e}");
     }
 
@@ -177,7 +181,10 @@ async fn dispatch_gateway_health(_db: &Database, io: &SocketIo) -> Result<()> {
         "reason": "hourly_health_check",
     });
 
-    if let Err(e) = io.emit(evo_common::messages::events::KING_CONFIG_UPDATE, &payload) {
+    if let Err(e) = io
+        .emit(evo_common::messages::events::KING_CONFIG_UPDATE, &payload)
+        .await
+    {
         anyhow::bail!("failed to broadcast king:config_update: {e}");
     }
 

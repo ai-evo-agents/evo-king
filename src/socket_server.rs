@@ -50,7 +50,7 @@ fn log_event(
 /// Called once at startup. Handlers are per-socket closures that capture a
 /// clone of `state` for async DB / broadcast operations.
 pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
-    io.ns("/", move |socket: SocketRef| {
+    io.ns("/", move |socket: SocketRef| async move {
         info!(sid = %socket.id, "runner connected");
 
         // Clone arcs for each handler so every closure is independent
@@ -92,8 +92,8 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         // dashboard:subscribe — dashboard clients join a read-only room
         socket.on(
             "dashboard:subscribe",
-            move |s: SocketRef, _data: Data<serde_json::Value>| {
-                let _ = s.join("dashboard");
+            move |s: SocketRef, _data: Data<serde_json::Value>| async move {
+                s.join("dashboard");
                 info!(sid = %s.id, "dashboard client subscribed");
             },
         );
@@ -161,8 +161,8 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                     log_event(&state.db, events::DEBUG_RESPONSE, "inbound", agent_id, "", "", &data);
                     let _ = state.io.to("dashboard").emit(
                         "dashboard:event",
-                        serde_json::json!({ "event": "debug:response", "data": data }),
-                    );
+                        &serde_json::json!({ "event": "debug:response", "data": data }),
+                    ).await;
 
                     // If task_id is present, update task and emit task:evaluate
                     if let Some(task_id) = data["task_id"].as_str().filter(|s| !s.is_empty()) {
@@ -184,8 +184,8 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                             "agent_id": agent_id,
                         });
                         let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
-                        let _ = state.io.to("role:evaluation").emit(events::TASK_EVALUATE, &eval_payload);
-                        let _ = state.io.to(task_room).emit(events::TASK_EVALUATE, &eval_payload);
+                        let _ = state.io.to("role:evaluation").emit(events::TASK_EVALUATE, &eval_payload).await;
+                        let _ = state.io.to(task_room).emit(events::TASK_EVALUATE, &eval_payload).await;
                     }
                 }
             },
@@ -199,13 +199,13 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                 async move {
                     let _ = state.io.to("dashboard").emit(
                         "dashboard:event",
-                        serde_json::json!({ "event": "debug:stream", "data": data }),
-                    );
+                        &serde_json::json!({ "event": "debug:stream", "data": data }),
+                    ).await;
 
                     // If task_id is present, also emit task:output to the task room
                     if let Some(task_id) = data["task_id"].as_str().filter(|s| !s.is_empty()) {
                         let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
-                        let _ = state.io.to(task_room).emit(events::TASK_OUTPUT, &data);
+                        let _ = state.io.to(task_room).emit(events::TASK_OUTPUT, &data).await;
                     }
                 }
             },
@@ -311,7 +311,7 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
                         return;
                     }
                     let room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
-                    let _ = s.join(room.clone());
+                    s.join(room.clone());
                     info!(agent_id = %agent_id, task_id = %task_id, room = %room, "agent joined task room");
                     log_event(&state.db, events::TASK_JOIN, "inbound", &agent_id, "", &room, &data);
                 }
@@ -350,28 +350,26 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         );
 
         socket.on_disconnect(
-            move |s: SocketRef, reason: socketioxide::socket::DisconnectReason| {
+            move |s: SocketRef, reason: socketioxide::socket::DisconnectReason| async move {
                 let state = Arc::clone(&s_disconnect);
                 let sid = s.id.to_string();
                 info!(sid = %sid, reason = ?reason, "runner disconnected");
 
                 // Look up agent by socket_id and record disconnect in history
-                tokio::spawn(async move {
-                    if let Ok(agents) = task_db::list_agents(&state.db).await
-                        && let Some(agent) = agents.iter().find(|a| a.socket_id == sid)
-                    {
-                        let _ = task_db::create_agent_history(
-                            &state.db,
-                            &agent.agent_id,
-                            &agent.status,
-                            "disconnected",
-                            "socket_disconnect",
-                            &format!("{reason:?}"),
-                            agent.pid as u32,
-                        )
-                        .await;
-                    }
-                });
+                if let Ok(agents) = task_db::list_agents(&state.db).await
+                    && let Some(agent) = agents.iter().find(|a| a.socket_id == sid)
+                {
+                    let _ = task_db::create_agent_history(
+                        &state.db,
+                        &agent.agent_id,
+                        &agent.status,
+                        "disconnected",
+                        "socket_disconnect",
+                        &format!("{reason:?}"),
+                        agent.pid as u32,
+                    )
+                    .await;
+                }
             },
         );
     });
@@ -424,11 +422,11 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
     };
 
     if is_kernel {
-        let _ = socket.join(events::ROOM_KERNEL);
+        socket.join(events::ROOM_KERNEL);
 
         // Also join role-specific room for targeted pipeline:next dispatch
         let role_room = format!("{}{}", events::ROOM_ROLE_PREFIX, role_str.replace('-', "_"));
-        let _ = socket.join(role_room.clone());
+        socket.join(role_room.clone());
         info!(
             role = %role_str,
             sid = %socket.id,
@@ -492,10 +490,14 @@ async fn on_register(socket: SocketRef, data: serde_json::Value, state: Arc<King
     );
 
     // Notify dashboard clients
-    let _ = state.io.to("dashboard").emit(
-        "dashboard:event",
-        serde_json::json!({ "event": "agent:register", "data": data }),
-    );
+    let _ = state
+        .io
+        .to("dashboard")
+        .emit(
+            "dashboard:event",
+            &serde_json::json!({ "event": "agent:register", "data": data }),
+        )
+        .await;
 
     // Send system discovery info to the newly registered agent
     {
@@ -527,10 +529,14 @@ async fn on_status(data: serde_json::Value, state: Arc<KingState>) {
     }
 
     // Notify dashboard clients
-    let _ = state.io.to("dashboard").emit(
-        "dashboard:event",
-        serde_json::json!({ "event": "agent:status", "data": data }),
-    );
+    let _ = state
+        .io
+        .to("dashboard")
+        .emit(
+            "dashboard:event",
+            &serde_json::json!({ "event": "agent:status", "data": data }),
+        )
+        .await;
 }
 
 async fn on_skill_report(data: serde_json::Value, state: Arc<KingState>) {
@@ -668,10 +674,14 @@ async fn on_pipeline_stage_result(data: serde_json::Value, state: Arc<KingState>
     }
 
     // Notify dashboard clients
-    let _ = state.io.to("dashboard").emit(
-        "dashboard:event",
-        serde_json::json!({ "event": "pipeline:stage_result", "data": data }),
-    );
+    let _ = state
+        .io
+        .to("dashboard")
+        .emit(
+            "dashboard:event",
+            &serde_json::json!({ "event": "pipeline:stage_result", "data": data }),
+        )
+        .await;
 }
 
 // ─── Task event handlers ─────────────────────────────────────────────────────
@@ -752,12 +762,14 @@ async fn on_task_create(
             if let Err(e) = socket
                 .to(events::ROOM_KERNEL)
                 .emit(events::TASK_CHANGED, &broadcast)
+                .await
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
             let _ = socket
                 .to("dashboard")
-                .emit(events::TASK_CHANGED, &broadcast);
+                .emit(events::TASK_CHANGED, &broadcast)
+                .await;
         }
         Err(e) => {
             warn!(err = %e, "failed to create task");
@@ -820,12 +832,14 @@ async fn on_task_update(
             if let Err(e) = socket
                 .to(events::ROOM_KERNEL)
                 .emit(events::TASK_CHANGED, &broadcast)
+                .await
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
             let _ = socket
                 .to("dashboard")
-                .emit(events::TASK_CHANGED, &broadcast);
+                .emit(events::TASK_CHANGED, &broadcast)
+                .await;
         }
         Ok(None) => {
             ack_error(ack, &format!("task not found: {task_id}"));
@@ -916,12 +930,14 @@ async fn on_task_delete(
             if let Err(e) = socket
                 .to(events::ROOM_KERNEL)
                 .emit(events::TASK_CHANGED, &broadcast)
+                .await
             {
                 warn!(err = %e, "failed to broadcast task:changed");
             }
             let _ = socket
                 .to("dashboard")
-                .emit(events::TASK_CHANGED, &broadcast);
+                .emit(events::TASK_CHANGED, &broadcast)
+                .await;
         }
         Ok(false) => {
             ack_error(ack, &format!("task not found: {task_id}"));
@@ -1004,11 +1020,15 @@ async fn on_memory_store(
             let broadcast = serde_json::json!({ "action": "created", "memory_id": row.id });
             let _ = socket
                 .to(events::ROOM_KERNEL)
-                .emit(events::MEMORY_CHANGED, &broadcast);
-            let _ = socket.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
-            );
+                .emit(events::MEMORY_CHANGED, &broadcast)
+                .await;
+            let _ = socket
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+                )
+                .await;
         }
         Err(e) => {
             warn!(err = %e, "failed to store memory");
@@ -1157,11 +1177,15 @@ async fn on_memory_update(
             let broadcast = serde_json::json!({ "action": "updated", "memory_id": memory_id });
             let _ = socket
                 .to(events::ROOM_KERNEL)
-                .emit(events::MEMORY_CHANGED, &broadcast);
-            let _ = socket.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
-            );
+                .emit(events::MEMORY_CHANGED, &broadcast)
+                .await;
+            let _ = socket
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+                )
+                .await;
         }
         Ok(None) => {
             ack_error(ack, &format!("memory not found: {memory_id}"));
@@ -1204,11 +1228,15 @@ async fn on_memory_delete(
             let broadcast = serde_json::json!({ "action": "deleted", "memory_id": memory_id });
             let _ = socket
                 .to(events::ROOM_KERNEL)
-                .emit(events::MEMORY_CHANGED, &broadcast);
-            let _ = socket.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({ "event": "memory:changed", "data": broadcast }),
-            );
+                .emit(events::MEMORY_CHANGED, &broadcast)
+                .await;
+            let _ = socket
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({ "event": "memory:changed", "data": broadcast }),
+                )
+                .await;
         }
         Ok(false) => {
             ack_error(ack, &format!("memory not found: {memory_id}"));
@@ -1330,10 +1358,12 @@ async fn on_task_summary(
         let broadcast = serde_json::json!({ "action": "evaluated", "task": task_json });
         let _ = socket
             .to(events::ROOM_KERNEL)
-            .emit(events::TASK_CHANGED, &broadcast);
+            .emit(events::TASK_CHANGED, &broadcast)
+            .await;
         let _ = socket
             .to("dashboard")
-            .emit(events::TASK_CHANGED, &broadcast);
+            .emit(events::TASK_CHANGED, &broadcast)
+            .await;
         // Also send as dashboard:event so the debug page picks it up
         let dashboard_evt = serde_json::json!({
             "event": "task:changed",
@@ -1341,6 +1371,7 @@ async fn on_task_summary(
         });
         let _ = socket
             .to("dashboard")
-            .emit("dashboard:event", &dashboard_evt);
+            .emit("dashboard:event", &dashboard_evt)
+            .await;
     }
 }

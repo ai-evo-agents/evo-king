@@ -167,6 +167,10 @@ async fn main() -> Result<()> {
             get(agent_model_get_handler).put(agent_model_put_handler),
         )
         .route("/gateway/models", get(gateway_models_handler))
+        .route(
+            "/gateway/models/refresh",
+            post(gateway_models_refresh_handler),
+        )
         .route("/pipeline/start", post(pipeline_start_handler))
         .route("/pipeline/runs", get(pipeline_list_handler))
         .route("/pipeline/runs/{run_id}", get(pipeline_detail_handler))
@@ -341,7 +345,8 @@ async fn system_info_refresh_handler(
     // Broadcast updated system info to all connected agents
     let _ = state
         .io
-        .emit(evo_common::messages::events::KING_SYSTEM_INFO, &result);
+        .emit(evo_common::messages::events::KING_SYSTEM_INFO, &result)
+        .await;
 
     Json(result)
 }
@@ -364,6 +369,7 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
                             .unwrap_or(json!([])),
                         "pid":                 a.pid,
                         "preferred_model":     a.preferred_model,
+                        "reasoning_effort":    a.reasoning_effort,
                         "soul_content":        a.soul_content,
                         "binary_path":         a.binary_path,
                         "version":             a.version,
@@ -381,17 +387,21 @@ async fn list_agents_handler(State(state): State<Arc<KingState>>) -> Json<serde_
     }
 }
 
-/// PUT /agents/:agent_id/model — set an agent's preferred model.
+/// PUT /agents/:agent_id/model — set an agent's preferred model and optional reasoning effort.
 async fn agent_model_put_handler(
     State(state): State<Arc<KingState>>,
     axum::extract::Path(agent_id): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let model = body["model"].as_str().unwrap_or("").to_string();
-    match task_db::set_agent_model(&state.db, &agent_id, &model).await {
+    let reasoning_effort = body["reasoning_effort"].as_str().map(|s| s.to_string());
+    match task_db::set_agent_model(&state.db, &agent_id, &model, reasoning_effort.as_deref()).await
+    {
         Ok(()) => {
-            info!(agent_id = %agent_id, model = %model, "updated agent model preference");
-            Json(json!({ "success": true, "agent_id": agent_id, "model": model }))
+            info!(agent_id = %agent_id, model = %model, reasoning_effort = ?reasoning_effort, "updated agent model preference");
+            Json(
+                json!({ "success": true, "agent_id": agent_id, "model": model, "reasoning_effort": reasoning_effort.unwrap_or_default() }),
+            )
         }
         Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
     }
@@ -408,27 +418,43 @@ async fn agent_model_get_handler(
     }
 }
 
+/// Resolve the gateway HTTP address from the config file.
+fn resolve_gateway_addr(config_path: &str) -> String {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(cfg) => {
+                let host = cfg["server"]["host"].as_str().unwrap_or("127.0.0.1");
+                let port = cfg["server"]["port"].as_u64().unwrap_or(8080);
+                let connect_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+                format!("http://{connect_host}:{port}")
+            }
+            Err(_) => "http://127.0.0.1:8080".to_string(),
+        },
+        Err(_) => "http://127.0.0.1:8080".to_string(),
+    }
+}
+
 /// GET /gateway/models — proxy to evo-gateway's /v1/models endpoint.
 async fn gateway_models_handler(State(state): State<Arc<KingState>>) -> Json<serde_json::Value> {
-    // Read gateway config to find the server address
-    let gateway_addr = match std::fs::read_to_string(&state.gateway_config_path) {
-        Ok(content) => {
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(cfg) => {
-                    let host = cfg["server"]["host"].as_str().unwrap_or("127.0.0.1");
-                    let port = cfg["server"]["port"].as_u64().unwrap_or(8080);
-                    // If host is 0.0.0.0, connect to localhost instead
-                    let connect_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
-                    format!("http://{connect_host}:{port}")
-                }
-                Err(_) => "http://127.0.0.1:8080".to_string(),
-            }
-        }
-        Err(_) => "http://127.0.0.1:8080".to_string(),
-    };
-
+    let gateway_addr = resolve_gateway_addr(&state.gateway_config_path);
     let url = format!("{gateway_addr}/v1/models");
     match state.http_client.get(&url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => Json(json),
+            Err(e) => Json(json!({ "error": format!("parse error: {e}") })),
+        },
+        Err(e) => Json(json!({ "error": format!("gateway unreachable: {e}") })),
+    }
+}
+
+/// POST /gateway/models/refresh — tell the gateway to invalidate its model cache
+/// and re-discover all models from upstream providers.
+async fn gateway_models_refresh_handler(
+    State(state): State<Arc<KingState>>,
+) -> Json<serde_json::Value> {
+    let gateway_addr = resolve_gateway_addr(&state.gateway_config_path);
+    let url = format!("{gateway_addr}/v1/models/refresh");
+    match state.http_client.post(&url).send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(json) => Json(json),
             Err(e) => Json(json!({ "error": format!("parse error: {e}") })),
@@ -519,6 +545,7 @@ async fn admin_config_sync_handler(State(state): State<Arc<KingState>>) -> Json<
     match state
         .io
         .emit(evo_common::messages::events::KING_CONFIG_UPDATE, &payload)
+        .await
     {
         Ok(_) => {
             info!("config-sync broadcast sent to all agents");
@@ -715,12 +742,13 @@ async fn debug_prompt_handler(
         let _ = state
             .io
             .to(evo_common::messages::events::ROOM_KERNEL)
-            .emit(evo_common::messages::events::TASK_INVITE, &invite);
+            .emit(evo_common::messages::events::TASK_INVITE, &invite)
+            .await;
         // Notify dashboard of new task
         let _ = state.io.to("dashboard").emit(
             evo_common::messages::events::TASK_CHANGED,
-            json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_prompt", "status": "running" } }),
-        );
+            &json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_prompt", "status": "running" } }),
+        ).await;
     }
 
     let payload = json!({
@@ -746,6 +774,7 @@ async fn debug_prompt_handler(
         .io
         .to(room)
         .emit(evo_common::messages::events::DEBUG_PROMPT, &payload)
+        .await
     {
         Ok(_) => Json(json!({ "success": true, "request_id": request_id, "task_id": task_id })),
         Err(e) => {
@@ -810,12 +839,13 @@ async fn debug_bash_handler(
         let _ = state
             .io
             .to(evo_common::messages::events::ROOM_KERNEL)
-            .emit(evo_common::messages::events::TASK_INVITE, &invite);
+            .emit(evo_common::messages::events::TASK_INVITE, &invite)
+            .await;
         // Notify dashboard of new task
         let _ = state.io.to("dashboard").emit(
             evo_common::messages::events::TASK_CHANGED,
-            json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_bash", "status": "running" } }),
-        );
+            &json!({ "action": "created", "task": { "id": task_id, "task_type": "debug_bash", "status": "running" } }),
+        ).await;
     }
 
     let io = state.io.clone();
@@ -843,17 +873,20 @@ async fn run_bash_pty(command: String, request_id: String, io: SocketIo) {
     let emit_task = tokio::spawn(async move {
         let mut chunk_index = 0u32;
         while let Some(text) = rx.recv().await {
-            let _ = io_emit.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({
-                    "event": "debug:stream",
-                    "data": {
-                        "request_id": req_id_emit,
-                        "delta": text,
-                        "chunk_index": chunk_index,
-                    }
-                }),
-            );
+            let _ = io_emit
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({
+                        "event": "debug:stream",
+                        "data": {
+                            "request_id": req_id_emit,
+                            "delta": text,
+                            "chunk_index": chunk_index,
+                        }
+                    }),
+                )
+                .await;
             chunk_index += 1;
         }
     });
@@ -867,18 +900,21 @@ async fn run_bash_pty(command: String, request_id: String, io: SocketIo) {
     let _ = emit_task.await;
 
     let elapsed = start.elapsed().as_millis() as u64;
-    let _ = io.to("dashboard").emit(
-        "dashboard:event",
-        serde_json::json!({
-            "event": "debug:response",
-            "data": {
-                "request_id": request_id,
-                "response": format!("\n[exit {}]", exit_code),
-                "latency_ms": elapsed,
-                "entry_type": "bash",
-            }
-        }),
-    );
+    let _ = io
+        .to("dashboard")
+        .emit(
+            "dashboard:event",
+            &serde_json::json!({
+                "event": "debug:response",
+                "data": {
+                    "request_id": request_id,
+                    "response": format!("\n[exit {}]", exit_code),
+                    "latency_ms": elapsed,
+                    "entry_type": "bash",
+                }
+            }),
+        )
+        .await;
 }
 
 /// Async wrapper with task tracking: spawns PTY subprocess, streams output to
@@ -911,18 +947,21 @@ async fn run_bash_pty_with_task(
 
         while let Some(text) = rx.recv().await {
             // Emit to dashboard
-            let _ = io_emit.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({
-                    "event": "debug:stream",
-                    "data": {
-                        "request_id": req_id_emit,
-                        "task_id": task_id_emit,
-                        "delta": text,
-                        "chunk_index": chunk_index,
-                    }
-                }),
-            );
+            let _ = io_emit
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({
+                        "event": "debug:stream",
+                        "data": {
+                            "request_id": req_id_emit,
+                            "task_id": task_id_emit,
+                            "delta": text,
+                            "chunk_index": chunk_index,
+                        }
+                    }),
+                )
+                .await;
 
             // Emit task:output to the task room
             if has_task {
@@ -931,15 +970,18 @@ async fn run_bash_pty_with_task(
                     evo_common::messages::events::ROOM_TASK_PREFIX,
                     task_id_emit,
                 );
-                let _ = io_emit.to(task_room).emit(
-                    evo_common::messages::events::TASK_OUTPUT,
-                    serde_json::json!({
-                        "task_id": task_id_emit,
-                        "request_id": req_id_emit,
-                        "delta": text,
-                        "chunk_index": chunk_index,
-                    }),
-                );
+                let _ = io_emit
+                    .to(task_room)
+                    .emit(
+                        evo_common::messages::events::TASK_OUTPUT,
+                        &serde_json::json!({
+                            "task_id": task_id_emit,
+                            "request_id": req_id_emit,
+                            "delta": text,
+                            "chunk_index": chunk_index,
+                        }),
+                    )
+                    .await;
             }
 
             // Accumulate output for evaluation (up to MAX_ACCUMULATED)
@@ -1002,19 +1044,22 @@ async fn run_bash_pty_with_task(
     let elapsed = start.elapsed().as_millis() as u64;
 
     // Emit final debug:response to dashboard
-    let _ = io.to("dashboard").emit(
-        "dashboard:event",
-        serde_json::json!({
-            "event": "debug:response",
-            "data": {
-                "request_id": request_id,
-                "task_id": task_id,
-                "response": format!("\n[exit {}]", exit_code),
-                "latency_ms": elapsed,
-                "entry_type": "bash",
-            }
-        }),
-    );
+    let _ = io
+        .to("dashboard")
+        .emit(
+            "dashboard:event",
+            &serde_json::json!({
+                "event": "debug:response",
+                "data": {
+                    "request_id": request_id,
+                    "task_id": task_id,
+                    "response": format!("\n[exit {}]", exit_code),
+                    "latency_ms": elapsed,
+                    "entry_type": "bash",
+                }
+            }),
+        )
+        .await;
 
     // Update task status and emit task:evaluate
     if has_task {
@@ -1050,16 +1095,18 @@ async fn run_bash_pty_with_task(
         );
         let _ = io
             .to("role:evaluation")
-            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload);
+            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload)
+            .await;
         let _ = io
             .to(task_room)
-            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload);
+            .emit(evo_common::messages::events::TASK_EVALUATE, &eval_payload)
+            .await;
 
         // Notify dashboard of task completion
         let _ = io.to("dashboard").emit(
             evo_common::messages::events::TASK_CHANGED,
-            serde_json::json!({ "action": "updated", "task": { "id": task_id, "status": status } }),
-        );
+            &serde_json::json!({ "action": "updated", "task": { "id": task_id, "status": status } }),
+        ).await;
     }
 }
 
@@ -1209,13 +1256,17 @@ async fn task_create_handler(
     {
         Ok(task) => {
             let task_json = task_row_to_json_http(&task);
-            let _ = state.io.to("dashboard").emit(
-                "dashboard:event",
-                serde_json::json!({
-                    "event": "task:created",
-                    "data": { "task": task_json }
-                }),
-            );
+            let _ = state
+                .io
+                .to("dashboard")
+                .emit(
+                    "dashboard:event",
+                    &serde_json::json!({
+                        "event": "task:created",
+                        "data": { "task": task_json }
+                    }),
+                )
+                .await;
             Json(json!({ "success": true, "task": task_row_to_json_http(&task) }))
         }
         Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
@@ -1430,14 +1481,18 @@ async fn memory_create_handler(
                 let _ = memory_db::bind_task_memory(&state.db, task_id, &row.id).await;
             }
             // Broadcast memory:changed
-            let _ = state.io.to("kernel").emit(
-                evo_common::messages::events::MEMORY_CHANGED,
-                json!({ "action": "created", "memory_id": row.id }),
-            );
+            let _ = state
+                .io
+                .to("kernel")
+                .emit(
+                    evo_common::messages::events::MEMORY_CHANGED,
+                    &json!({ "action": "created", "memory_id": row.id }),
+                )
+                .await;
             let _ = state.io.to("dashboard").emit(
                 "dashboard:event",
-                json!({ "event": "memory:changed", "data": { "action": "created", "memory_id": row.id } }),
-            );
+                &json!({ "event": "memory:changed", "data": { "action": "created", "memory_id": row.id } }),
+            ).await;
             Json(json!({ "success": true, "memory": memory_row_to_json(&row) }))
         }
         Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
@@ -1537,14 +1592,18 @@ async fn memory_update_handler(
                     let _ = memory_db::upsert_tier(&state.db, &memory_id, tier, content).await;
                 }
             }
-            let _ = state.io.to("kernel").emit(
-                evo_common::messages::events::MEMORY_CHANGED,
-                json!({ "action": "updated", "memory_id": memory_id }),
-            );
+            let _ = state
+                .io
+                .to("kernel")
+                .emit(
+                    evo_common::messages::events::MEMORY_CHANGED,
+                    &json!({ "action": "updated", "memory_id": memory_id }),
+                )
+                .await;
             let _ = state.io.to("dashboard").emit(
                 "dashboard:event",
-                json!({ "event": "memory:changed", "data": { "action": "updated", "memory_id": memory_id } }),
-            );
+                &json!({ "event": "memory:changed", "data": { "action": "updated", "memory_id": memory_id } }),
+            ).await;
             Json(json!({ "success": true, "memory": memory_row_to_json(&row) }))
         }
         Ok(None) => Json(json!({ "success": false, "error": "not found" })),
@@ -1559,14 +1618,18 @@ async fn memory_delete_handler(
 ) -> Json<serde_json::Value> {
     match memory_db::delete_memory(&state.db, &memory_id).await {
         Ok(true) => {
-            let _ = state.io.to("kernel").emit(
-                evo_common::messages::events::MEMORY_CHANGED,
-                json!({ "action": "deleted", "memory_id": memory_id }),
-            );
+            let _ = state
+                .io
+                .to("kernel")
+                .emit(
+                    evo_common::messages::events::MEMORY_CHANGED,
+                    &json!({ "action": "deleted", "memory_id": memory_id }),
+                )
+                .await;
             let _ = state.io.to("dashboard").emit(
                 "dashboard:event",
-                json!({ "event": "memory:changed", "data": { "action": "deleted", "memory_id": memory_id } }),
-            );
+                &json!({ "event": "memory:changed", "data": { "action": "deleted", "memory_id": memory_id } }),
+            ).await;
             Json(json!({ "success": true }))
         }
         Ok(false) => Json(json!({ "success": false, "error": "not found" })),
@@ -1837,6 +1900,7 @@ async fn agent_detail_handler(
                 .unwrap_or(json!([])),
             "pid":                 agent.pid,
             "preferred_model":     agent.preferred_model,
+            "reasoning_effort":    agent.reasoning_effort,
             "soul_content":        agent.soul_content,
             "binary_path":         agent.binary_path,
             "version":             agent.version,

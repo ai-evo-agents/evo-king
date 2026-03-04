@@ -326,6 +326,8 @@ pub async fn init_db(path: &str) -> Result<Database> {
         "ALTER TABLE agent_status ADD COLUMN registration_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_status ADD COLUMN crash_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agent_status ADD COLUMN socket_id TEXT NOT NULL DEFAULT ''",
+        // Phase 11: per-agent reasoning effort preference
+        "ALTER TABLE agent_status ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
     ];
 
     for sql in &migrations {
@@ -440,6 +442,7 @@ pub struct AgentRow {
     pub registration_count: i64,
     pub crash_count: i64,
     pub socket_id: String,
+    pub reasoning_effort: String,
 }
 
 /// List all registered agents ordered by agent_id.
@@ -449,7 +452,8 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
     let mut rows = conn
         .query(
             "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model,
-                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id
+                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id,
+                    reasoning_effort
              FROM agent_status ORDER BY agent_id",
             (),
         )
@@ -474,6 +478,7 @@ pub async fn list_agents(db: &Database) -> Result<Vec<AgentRow>> {
             registration_count: row.get::<i64>(12).unwrap_or(0),
             crash_count: row.get::<i64>(13).unwrap_or(0),
             socket_id: row.get::<String>(14).unwrap_or_default(),
+            reasoning_effort: row.get::<String>(15).unwrap_or_default(),
         });
     }
 
@@ -487,7 +492,8 @@ pub async fn get_agent(db: &Database, agent_id: &str) -> Result<Option<AgentRow>
     let mut rows = conn
         .query(
             "SELECT agent_id, role, status, last_heartbeat, capabilities, skills, pid, preferred_model,
-                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id
+                    soul_content, binary_path, version, first_registered_at, registration_count, crash_count, socket_id,
+                    reasoning_effort
              FROM agent_status WHERE agent_id = ?1",
             libsql::params![agent_id],
         )
@@ -511,6 +517,7 @@ pub async fn get_agent(db: &Database, agent_id: &str) -> Result<Option<AgentRow>
             registration_count: row.get::<i64>(12).unwrap_or(0),
             crash_count: row.get::<i64>(13).unwrap_or(0),
             socket_id: row.get::<String>(14).unwrap_or_default(),
+            reasoning_effort: row.get::<String>(15).unwrap_or_default(),
         })),
         None => Ok(None),
     }
@@ -532,12 +539,17 @@ pub async fn get_agent_status(db: &Database, agent_id: &str) -> Result<String> {
     }
 }
 
-/// Set the preferred model for an agent.
-pub async fn set_agent_model(db: &Database, agent_id: &str, model: &str) -> Result<()> {
+/// Set the preferred model and optional reasoning effort for an agent.
+pub async fn set_agent_model(
+    db: &Database,
+    agent_id: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<()> {
     let conn = db_connect(db).await?;
     conn.execute(
-        "UPDATE agent_status SET preferred_model = ?1 WHERE agent_id = ?2",
-        libsql::params![model, agent_id],
+        "UPDATE agent_status SET preferred_model = ?1, reasoning_effort = ?2 WHERE agent_id = ?3",
+        libsql::params![model, reasoning_effort.unwrap_or(""), agent_id],
     )
     .await
     .context("set agent model")?;

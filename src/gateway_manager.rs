@@ -70,7 +70,7 @@ pub async fn on_config_change(config_path: &str, state: &KingState) -> Result<()
         "providers": config.providers.len()
     });
 
-    if let Err(e) = state.io.emit(events::KING_CONFIG_UPDATE, &payload) {
+    if let Err(e) = state.io.emit(events::KING_CONFIG_UPDATE, &payload).await {
         warn!(err = %e, "failed to broadcast config update to runners");
     }
 

@@ -77,9 +77,9 @@ impl PipelineCoordinator {
         .await;
 
         // Broadcast task:changed + task:log to dashboard
-        self.broadcast_task_changed(&task_row);
+        self.broadcast_task_changed(&task_row).await;
         if let Ok(log) = &log_row {
-            self.broadcast_task_log(&task_row.id, log);
+            self.broadcast_task_log(&task_row.id, log).await;
         }
 
         // Emit task:invite to kernel room so all agents can join the task room
@@ -92,6 +92,7 @@ impl PipelineCoordinator {
             .io
             .to("kernel")
             .emit(events::TASK_INVITE, &invite_payload)
+            .await
         {
             warn!(run_id = %run_id, err = %e, "failed to emit task:invite to kernel room");
         }
@@ -109,14 +110,19 @@ impl PipelineCoordinator {
             .io
             .to(room.clone())
             .emit(events::PIPELINE_NEXT, &payload)
+            .await
         {
             error!(run_id = %run_id, room = %room, err = %e, "failed to emit pipeline:next");
         }
         // Notify dashboard clients
-        let _ = self.io.to("dashboard").emit(
-            "dashboard:event",
-            serde_json::json!({ "event": "pipeline:next", "data": payload }),
-        );
+        let _ = self
+            .io
+            .to("dashboard")
+            .emit(
+                "dashboard:event",
+                &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+            )
+            .await;
 
         Ok(run_id)
     }
@@ -224,10 +230,10 @@ impl PipelineCoordinator {
                 if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
                     && let Some(ref ut) = updated
                 {
-                    self.broadcast_task_changed(ut);
+                    self.broadcast_task_changed(ut).await;
                 }
                 if let Ok(ref l) = log {
-                    self.broadcast_task_log(&t.id, l);
+                    self.broadcast_task_log(&t.id, l).await;
                 }
             }
             return Ok(());
@@ -253,7 +259,7 @@ impl PipelineCoordinator {
                 )
                 .await;
                 if let Ok(ref l) = log {
-                    self.broadcast_task_log(&t.id, l);
+                    self.broadcast_task_log(&t.id, l).await;
                 }
             }
 
@@ -303,10 +309,10 @@ impl PipelineCoordinator {
                         if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
                             && let Some(ref ut) = updated
                         {
-                            self.broadcast_task_changed(ut);
+                            self.broadcast_task_changed(ut).await;
                         }
                         if let Ok(ref l) = log {
-                            self.broadcast_task_log(&t.id, l);
+                            self.broadcast_task_log(&t.id, l).await;
                         }
                     }
 
@@ -323,6 +329,7 @@ impl PipelineCoordinator {
                         .io
                         .to(room.clone())
                         .emit(events::PIPELINE_NEXT, &payload)
+                        .await
                     {
                         error!(
                             run_id = %run_id,
@@ -333,10 +340,14 @@ impl PipelineCoordinator {
                         );
                     }
                     // Notify dashboard clients
-                    let _ = self.io.to("dashboard").emit(
-                        "dashboard:event",
-                        serde_json::json!({ "event": "pipeline:next", "data": payload }),
-                    );
+                    let _ = self
+                        .io
+                        .to("dashboard")
+                        .emit(
+                            "dashboard:event",
+                            &serde_json::json!({ "event": "pipeline:next", "data": payload }),
+                        )
+                        .await;
 
                     info!(
                         run_id = %run_id,
@@ -377,10 +388,10 @@ impl PipelineCoordinator {
                         if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
                             && let Some(ref ut) = updated
                         {
-                            self.broadcast_task_changed(ut);
+                            self.broadcast_task_changed(ut).await;
                         }
                         if let Ok(ref l) = log {
-                            self.broadcast_task_log(&t.id, l);
+                            self.broadcast_task_log(&t.id, l).await;
                         }
                     }
 
@@ -461,7 +472,7 @@ impl PipelineCoordinator {
                         task_type = %task_type,
                         "subtask created from evaluation output"
                     );
-                    self.broadcast_task_changed(&subtask);
+                    self.broadcast_task_changed(&subtask).await;
 
                     let _ = task_db::create_task_log(
                         &self.db,
@@ -548,10 +559,10 @@ impl PipelineCoordinator {
                             if let Ok(updated) = task_db::get_task(&self.db, &task.id).await
                                 && let Some(ref ut) = updated
                             {
-                                self.broadcast_task_changed(ut);
+                                self.broadcast_task_changed(ut).await;
                             }
                             if let Ok(ref l) = log {
-                                self.broadcast_task_log(&task.id, l);
+                                self.broadcast_task_log(&task.id, l).await;
                             }
                         }
                     }
@@ -628,7 +639,7 @@ impl PipelineCoordinator {
     // ── Broadcast helpers ─────────────────────────────────────────────────────
 
     /// Broadcast a `task:changed` event to the dashboard room.
-    fn broadcast_task_changed(&self, task: &task_db::TaskRow) {
+    async fn broadcast_task_changed(&self, task: &task_db::TaskRow) {
         let payload = serde_json::json!({
             "action": "updated",
             "task": {
@@ -645,11 +656,11 @@ impl PipelineCoordinator {
                 "updated_at":    task.updated_at,
             },
         });
-        let _ = self.io.to("dashboard").emit("task:changed", &payload);
+        let _ = self.io.to("dashboard").emit("task:changed", &payload).await;
     }
 
     /// Broadcast a `task:log` event to the dashboard room and the task room.
-    fn broadcast_task_log(&self, task_id: &str, log: &task_db::TaskLogRow) {
+    async fn broadcast_task_log(&self, task_id: &str, log: &task_db::TaskLogRow) {
         let payload = serde_json::json!({
             "task_id": task_id,
             "log": {
@@ -662,11 +673,11 @@ impl PipelineCoordinator {
                 "created_at": log.created_at,
             },
         });
-        let _ = self.io.to("dashboard").emit("task:log", &payload);
+        let _ = self.io.to("dashboard").emit("task:log", &payload).await;
 
         // Also emit to the task-specific room so joined agents can observe
         let task_room = format!("{}{}", events::ROOM_TASK_PREFIX, task_id);
-        let _ = self.io.to(task_room).emit(events::TASK_LOG, &payload);
+        let _ = self.io.to(task_room).emit(events::TASK_LOG, &payload).await;
     }
 
     /// List all pipeline runs for HTTP API.

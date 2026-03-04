@@ -8,8 +8,8 @@ name = "evo-king"
 path = "src/main.rs"
 
 [dependencies]
-axum          = "0.7"
-socketioxide  = "0.14"
+axum          = "0.8"
+socketioxide  = "0.18"
 tokio         = { version = "1", features = ["full"] }
 notify        = "8"
 libsql        = "0.6"
