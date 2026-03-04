@@ -4,13 +4,30 @@ use evo_common::messages::{PipelineStage, events};
 use libsql::Database;
 use serde_json::Value;
 use socketioxide::SocketIo;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 /// Default stage timeout in seconds (5 minutes).
 const DEFAULT_STAGE_TIMEOUT_SECS: i64 = 300;
+
+/// Maximum retries for a failed pipeline stage.
+const MAX_STAGE_RETRIES: u32 = 3;
+
+/// Timeout in seconds for recovery/decompose requests.
+#[allow(dead_code)]
+const RECOVERY_TIMEOUT_SECS: u64 = 30;
+
+/// Tracks an in-flight recovery or decompose request.
+#[allow(dead_code)]
+struct PendingRequest {
+    run_id: String,
+    task_id: String,
+    request_type: String, // "recovery" or "decompose"
+}
 
 /// Coordinates the evolution pipeline across kernel agents.
 ///
@@ -22,11 +39,16 @@ const DEFAULT_STAGE_TIMEOUT_SECS: i64 = 300;
 pub struct PipelineCoordinator {
     db: Arc<Database>,
     io: SocketIo,
+    pending_requests: Mutex<HashMap<String, PendingRequest>>,
 }
 
 impl PipelineCoordinator {
     pub fn new(db: Arc<Database>, io: SocketIo) -> Self {
-        Self { db, io }
+        Self {
+            db,
+            io,
+            pending_requests: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Start a new pipeline run. Creates a DB record for the `learning` stage,
@@ -38,7 +60,8 @@ impl PipelineCoordinator {
         let stage_str = stage_to_str(&first_stage);
 
         // Create the first stage record
-        let _row = task_db::create_pipeline_stage(&self.db, &run_id, stage_str, "")
+        let metadata_str = serde_json::to_string(&trigger_metadata).unwrap_or_default();
+        let _row = task_db::create_pipeline_stage(&self.db, &run_id, stage_str, "", &metadata_str)
             .await
             .context("create initial pipeline stage")?;
 
@@ -189,33 +212,30 @@ impl PipelineCoordinator {
             .ok()
             .flatten();
 
-        // If failed, the pipeline run stops here
+        // If failed, initiate error recovery
         if status == "failed" {
             let err_text = error_msg.unwrap_or("unknown error");
             warn!(
                 run_id = %run_id,
                 stage = %stage_str,
                 error = %err_text,
-                "pipeline run failed at stage"
+                "pipeline stage failed — initiating error recovery"
             );
 
             // Extract memory for the failed stage
-            let task_id = task.as_ref().map(|t| t.id.as_str());
-            self.extract_stage_memory(run_id, stage_str, agent_id, artifact_id, output, task_id)
-                .await;
+            let task_id_ref = task.as_ref().map(|t| t.id.as_str());
+            self.extract_stage_memory(
+                run_id,
+                stage_str,
+                agent_id,
+                artifact_id,
+                output,
+                task_id_ref,
+            )
+            .await;
 
+            // Log the failure
             if let Some(ref t) = task {
-                let fail_summary = format!("Failed at {} — {}", stage_str, err_text);
-                let _ = task_db::update_task(
-                    &self.db,
-                    &t.id,
-                    Some("failed"),
-                    None,
-                    None,
-                    None,
-                    Some(&fail_summary),
-                )
-                .await;
                 let log = task_db::create_task_log(
                     &self.db,
                     &t.id,
@@ -226,16 +246,79 @@ impl PipelineCoordinator {
                     stage_str,
                 )
                 .await;
-                // Broadcast updates
+                if let Ok(ref l) = log {
+                    self.broadcast_task_log(&t.id, l).await;
+                }
+            }
+
+            // Get current retry count
+            let retry_count = task_db::get_stage_retry_count(&self.db, run_id, stage_str)
+                .await
+                .unwrap_or(0);
+
+            // Set task status to "recovering"
+            if let Some(ref t) = task {
+                let _ = task_db::update_task(
+                    &self.db,
+                    &t.id,
+                    Some("recovering"),
+                    None,
+                    None,
+                    None,
+                    Some(&format!("Error recovery in progress for {}", stage_str)),
+                )
+                .await;
                 if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
                     && let Some(ref ut) = updated
                 {
                     self.broadcast_task_changed(ut).await;
                 }
-                if let Ok(ref l) = log {
-                    self.broadcast_task_log(&t.id, l).await;
-                }
             }
+
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let task_id_str = task.as_ref().map(|t| t.id.clone()).unwrap_or_default();
+            let task_summary = task.as_ref().map(|t| t.summary.clone()).unwrap_or_default();
+
+            {
+                let mut pending = self.pending_requests.lock().await;
+                pending.insert(
+                    request_id.clone(),
+                    PendingRequest {
+                        run_id: run_id.to_string(),
+                        task_id: task_id_str.clone(),
+                        request_type: "recovery".to_string(),
+                    },
+                );
+            }
+
+            let recovery_payload = serde_json::json!({
+                "request_id": request_id,
+                "run_id": run_id,
+                "task_id": task_id_str,
+                "failed_stage": stage_str,
+                "error_message": err_text,
+                "stage_output": output,
+                "retry_count": retry_count,
+                "task_summary": task_summary,
+            });
+
+            if let Err(e) = self
+                .io
+                .to("role:evaluation")
+                .emit(events::ERROR_RECOVERY_REQUEST, &recovery_payload)
+                .await
+            {
+                error!(run_id = %run_id, err = %e, "failed to emit recovery request — aborting");
+                self.pending_requests.lock().await.remove(&request_id);
+                self.abort_pipeline(
+                    run_id,
+                    task.as_ref(),
+                    stage_str,
+                    "No recovery agent available",
+                )
+                .await;
+            }
+
             return Ok(());
         }
 
@@ -278,9 +361,16 @@ impl PipelineCoordinator {
                     let next_str = stage_to_str(&next);
 
                     // Create the next stage record
-                    task_db::create_pipeline_stage(&self.db, run_id, next_str, artifact_id)
-                        .await
-                        .context("create next pipeline stage")?;
+                    let metadata_str = output.to_string();
+                    task_db::create_pipeline_stage(
+                        &self.db,
+                        run_id,
+                        next_str,
+                        artifact_id,
+                        &metadata_str,
+                    )
+                    .await
+                    .context("create next pipeline stage")?;
 
                     // Update the task: advance stage + summary
                     if let Some(ref t) = task {
@@ -439,7 +529,7 @@ impl PipelineCoordinator {
     /// Each entry in `subtask_defs` should have `task_type`, `summary`, and
     /// optionally `payload`. The created tasks are linked to `parent_task` via
     /// `parent_id` and share the same `run_id`.
-    async fn create_subtasks(
+    pub(crate) async fn create_subtasks(
         &self,
         parent_task: &task_db::TaskRow,
         subtask_defs: &[serde_json::Value],
@@ -492,6 +582,395 @@ impl PipelineCoordinator {
                         "failed to create subtask"
                     );
                 }
+            }
+        }
+    }
+
+    /// Handle the evaluation agent's error recovery recommendation.
+    pub async fn on_recovery_response(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        task_id: &str,
+        action: &str,
+        params: &Value,
+        reasoning: &str,
+    ) -> Result<()> {
+        // Dedup: only process the first response for a given request_id
+        {
+            let mut pending = self.pending_requests.lock().await;
+            if pending.remove(request_id).is_none() {
+                info!(request_id = %request_id, "stale or duplicate recovery response, ignoring");
+                return Ok(());
+            }
+        }
+
+        info!(
+            run_id = %run_id,
+            action = %action,
+            reasoning = %reasoning,
+            "error recovery response received"
+        );
+
+        let task = task_db::get_task(&self.db, task_id).await.ok().flatten();
+        let stage_str = task
+            .as_ref()
+            .map(|t| t.current_stage.as_str())
+            .unwrap_or("");
+
+        // Log the recovery decision
+        if let Some(ref t) = task {
+            let _ = task_db::create_task_log(
+                &self.db,
+                &t.id,
+                "info",
+                &format!("Recovery decision: {} — {}", action, reasoning),
+                &params.to_string(),
+                "",
+                stage_str,
+            )
+            .await;
+        }
+
+        match action {
+            "retry" => {
+                let retry_count = task_db::get_stage_retry_count(&self.db, run_id, stage_str)
+                    .await
+                    .unwrap_or(0);
+
+                if retry_count >= MAX_STAGE_RETRIES {
+                    warn!(run_id = %run_id, "max retries exceeded — aborting");
+                    self.abort_pipeline(run_id, task.as_ref(), stage_str, "Max retries exceeded")
+                        .await;
+                    return Ok(());
+                }
+
+                // Find the current stage record and retry it
+                let stages = task_db::get_pipeline_run_stages(&self.db, run_id).await?;
+                if let Some(stage_row) = stages.iter().rev().find(|s| s.stage == stage_str) {
+                    task_db::retry_pipeline_stage(&self.db, &stage_row.id).await?;
+
+                    if let Some(ref t) = task {
+                        let _ = task_db::update_task(
+                            &self.db,
+                            &t.id,
+                            Some("running"),
+                            None,
+                            None,
+                            None,
+                            Some(&format!(
+                                "Retrying {} (attempt {})",
+                                stage_str,
+                                retry_count + 2
+                            )),
+                        )
+                        .await;
+                        if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                            && let Some(ref ut) = updated
+                        {
+                            self.broadcast_task_changed(ut).await;
+                        }
+                    }
+
+                    // Re-emit pipeline:next using stored input_metadata
+                    let metadata: Value = serde_json::from_str(&stage_row.input_metadata)
+                        .unwrap_or(serde_json::json!({}));
+                    let payload = serde_json::json!({
+                        "run_id": run_id,
+                        "stage": stage_str,
+                        "artifact_id": stage_row.artifact_id,
+                        "metadata": metadata,
+                        "is_retry": true,
+                        "retry_count": retry_count + 1,
+                    });
+
+                    if let Some(pipeline_stage) = str_to_stage(stage_str) {
+                        let room = stage_to_room(&pipeline_stage);
+                        let _ = self.io.to(room).emit(events::PIPELINE_NEXT, &payload).await;
+                    }
+
+                    info!(
+                        run_id = %run_id,
+                        stage = %stage_str,
+                        retry = retry_count + 1,
+                        "pipeline stage retry emitted"
+                    );
+                }
+            }
+            "decompose" => {
+                if let Some(ref t) = task {
+                    if let Some(subtasks) = params.get("subtasks").and_then(|v| v.as_array()) {
+                        self.create_subtasks(t, subtasks, run_id, "evaluation")
+                            .await;
+                    }
+                    let _ = task_db::update_task(
+                        &self.db,
+                        &t.id,
+                        Some("decomposed"),
+                        None,
+                        None,
+                        None,
+                        Some("Task decomposed into subtasks after failure"),
+                    )
+                    .await;
+                    if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                        && let Some(ref ut) = updated
+                    {
+                        self.broadcast_task_changed(ut).await;
+                    }
+                }
+            }
+            "skip" => {
+                if stage_str == "evaluation" || stage_str == "skill_manage" {
+                    info!(run_id = %run_id, stage = %stage_str, "skipping failed stage");
+                    if let Some(ref t) = task {
+                        let _ = task_db::create_task_log(
+                            &self.db,
+                            &t.id,
+                            "warn",
+                            &format!("Stage {} skipped after failure", stage_str),
+                            reasoning,
+                            "",
+                            stage_str,
+                        )
+                        .await;
+                    }
+
+                    if let Some(current) = str_to_stage(stage_str) {
+                        match next_stage(&current) {
+                            Some(next) => {
+                                let next_str = stage_to_str(&next);
+                                let metadata_str = params.to_string();
+                                task_db::create_pipeline_stage(
+                                    &self.db,
+                                    run_id,
+                                    next_str,
+                                    "",
+                                    &metadata_str,
+                                )
+                                .await
+                                .context("create next pipeline stage after skip")?;
+
+                                if let Some(ref t) = task {
+                                    let next_summary =
+                                        format!("{} — {}", next_str, stage_summary(next_str));
+                                    let _ = task_db::update_task(
+                                        &self.db,
+                                        &t.id,
+                                        Some("running"),
+                                        None,
+                                        None,
+                                        Some(next_str),
+                                        Some(&next_summary),
+                                    )
+                                    .await;
+                                    if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                                        && let Some(ref ut) = updated
+                                    {
+                                        self.broadcast_task_changed(ut).await;
+                                    }
+                                }
+
+                                let payload = serde_json::json!({
+                                    "run_id": run_id,
+                                    "stage": next_str,
+                                    "artifact_id": "",
+                                    "metadata": {},
+                                });
+                                let room = stage_to_room(&next);
+                                let _ =
+                                    self.io.to(room).emit(events::PIPELINE_NEXT, &payload).await;
+                            }
+                            None => {
+                                if let Some(ref t) = task {
+                                    let _ = task_db::update_task(
+                                        &self.db,
+                                        &t.id,
+                                        Some("completed"),
+                                        None,
+                                        None,
+                                        None,
+                                        Some("Pipeline completed (with skipped stage)"),
+                                    )
+                                    .await;
+                                    if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                                        && let Some(ref ut) = updated
+                                    {
+                                        self.broadcast_task_changed(ut).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    warn!(
+                        run_id = %run_id,
+                        stage = %stage_str,
+                        "skip not allowed for this stage — aborting"
+                    );
+                    self.abort_pipeline(
+                        run_id,
+                        task.as_ref(),
+                        stage_str,
+                        "Skip not allowed for critical stage",
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                self.abort_pipeline(run_id, task.as_ref(), stage_str, reasoning)
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Request decomposition of a task by the evaluation agent.
+    pub async fn request_decomposition(
+        &self,
+        task: &task_db::TaskRow,
+        trigger: &str,
+    ) -> Result<()> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(
+                request_id.clone(),
+                PendingRequest {
+                    run_id: task.run_id.clone(),
+                    task_id: task.id.clone(),
+                    request_type: "decompose".to_string(),
+                },
+            );
+        }
+
+        let payload_val: Value = serde_json::from_str(&task.payload).unwrap_or_default();
+        let decompose_payload = serde_json::json!({
+            "request_id": request_id,
+            "run_id": task.run_id,
+            "task_id": task.id,
+            "task_type": task.task_type,
+            "summary": task.summary,
+            "payload": payload_val,
+            "context": {},
+            "trigger": trigger,
+        });
+
+        self.io
+            .to("role:evaluation")
+            .emit(events::TASK_DECOMPOSE, &decompose_payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("emit task:decompose to evaluation agent: {e}"))?;
+
+        info!(task_id = %task.id, trigger = %trigger, "decomposition requested from evaluation agent");
+        Ok(())
+    }
+
+    /// Handle the decomposition result from the evaluation agent.
+    pub async fn on_decompose_result(
+        &self,
+        request_id: &str,
+        task_id: &str,
+        should_decompose: bool,
+        subtasks: &[Value],
+        reasoning: &str,
+    ) -> Result<()> {
+        // Dedup
+        let pending_info = {
+            let mut pending = self.pending_requests.lock().await;
+            pending.remove(request_id)
+        };
+
+        if pending_info.is_none() {
+            info!(request_id = %request_id, "stale decompose response, ignoring");
+            return Ok(());
+        }
+
+        info!(
+            task_id = %task_id,
+            should_decompose = %should_decompose,
+            subtask_count = subtasks.len(),
+            "decompose result received"
+        );
+
+        if should_decompose
+            && !subtasks.is_empty()
+            && let Ok(Some(task)) = task_db::get_task(&self.db, task_id).await
+        {
+            self.create_subtasks(&task, subtasks, &task.run_id, "evaluation")
+                .await;
+
+            let _ = task_db::update_task(
+                &self.db,
+                &task.id,
+                Some("decomposed"),
+                None,
+                None,
+                None,
+                Some(&format!("Task decomposed: {}", reasoning)),
+            )
+            .await;
+            if let Ok(updated) = task_db::get_task(&self.db, &task.id).await
+                && let Some(ref ut) = updated
+            {
+                self.broadcast_task_changed(ut).await;
+            }
+
+            let _ = task_db::create_task_log(
+                &self.db,
+                &task.id,
+                "info",
+                &format!(
+                    "Task decomposed into {} subtasks: {}",
+                    subtasks.len(),
+                    reasoning
+                ),
+                "",
+                "",
+                "",
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Abort a pipeline run — mark task as failed.
+    pub(crate) async fn abort_pipeline(
+        &self,
+        _run_id: &str,
+        task: Option<&task_db::TaskRow>,
+        stage_str: &str,
+        reason: &str,
+    ) {
+        if let Some(t) = task {
+            let summary = format!("Aborted at {} — {}", stage_str, reason);
+            let _ = task_db::update_task(
+                &self.db,
+                &t.id,
+                Some("failed"),
+                None,
+                None,
+                None,
+                Some(&summary),
+            )
+            .await;
+            let _ = task_db::create_task_log(
+                &self.db,
+                &t.id,
+                "error",
+                &format!("Pipeline aborted: {}", reason),
+                "",
+                "",
+                stage_str,
+            )
+            .await;
+            if let Ok(updated) = task_db::get_task(&self.db, &t.id).await
+                && let Some(ref ut) = updated
+            {
+                self.broadcast_task_changed(ut).await;
             }
         }
     }
@@ -721,6 +1200,18 @@ fn stage_to_str(stage: &PipelineStage) -> &'static str {
         PipelineStage::PreLoad => "pre_load",
         PipelineStage::Evaluation => "evaluation",
         PipelineStage::SkillManage => "skill_manage",
+    }
+}
+
+/// Parse a snake_case string back into a PipelineStage.
+fn str_to_stage(s: &str) -> Option<PipelineStage> {
+    match s {
+        "learning" => Some(PipelineStage::Learning),
+        "building" => Some(PipelineStage::Building),
+        "pre_load" => Some(PipelineStage::PreLoad),
+        "evaluation" => Some(PipelineStage::Evaluation),
+        "skill_manage" => Some(PipelineStage::SkillManage),
+        _ => None,
     }
 }
 

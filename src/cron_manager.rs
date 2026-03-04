@@ -168,7 +168,7 @@ async fn dispatch_update_check(db: &Database, io: &SocketIo) -> Result<()> {
     }
 
     // Record in pipeline_runs for visibility in GET /pipeline/runs
-    let _ = task_db::create_pipeline_stage(db, &run_id, stage, "").await;
+    let _ = task_db::create_pipeline_stage(db, &run_id, stage, "", "{}").await;
 
     info!(run_id = %run_id, room = %room, "dispatched update check via cron");
     Ok(())

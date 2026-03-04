@@ -104,6 +104,10 @@ Registered agents can be queried via the `GET /agents` HTTP endpoint. Full agent
 | `pipeline:next` | King -> Runner | `PipelineNext` | Advance to next pipeline stage |
 | `pipeline:stage_result` | Runner -> King | `PipelineStageResult` | Agent reports stage completion/failure |
 | `king:system_info` | King -> Runner | `SystemDiscovery` | System info sent on registration + on-demand |
+| `error:recovery_request` | King -> Runner | `ErrorRecoveryRequest` | Ask evaluation agent for recovery action on failure |
+| `error:recovery_response` | Runner -> King | `ErrorRecoveryResponse` | Evaluation agent returns recovery decision |
+| `task:decompose` | King -> Runner | `TaskDecomposeRequest` | Ask evaluation agent to decompose a complex task |
+| `task:decompose_result` | Runner -> King | `TaskDecomposeResponse` | Evaluation agent returns subtask breakdown |
 
 ---
 
@@ -127,13 +131,15 @@ CREATE TABLE tasks (
 
 -- Pipeline execution history
 CREATE TABLE pipeline_runs (
-    id          TEXT PRIMARY KEY,
-    stage       TEXT NOT NULL,
-    artifact_id TEXT NOT NULL DEFAULT '',
-    status      TEXT NOT NULL DEFAULT 'pending',
-    result      TEXT,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    id              TEXT PRIMARY KEY,
+    stage           TEXT NOT NULL,
+    artifact_id     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    result          TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    input_metadata  TEXT NOT NULL DEFAULT '{}'
 );
 
 -- Agent status + heartbeat tracking
@@ -343,10 +349,12 @@ Learning → Building → PreLoad → Evaluation → SkillManage → [complete]
 
 **Flow:**
 1. `POST /pipeline/start` or internal trigger creates a new run and emits `pipeline:next` to `role:learning` room.
-2. Learning agent processes discovery, emits `pipeline:stage_result` with status `completed` and output.
-3. Coordinator advances to next stage: creates new DB record, emits `pipeline:next` to `role:building` room.
-4. Process repeats through all 5 stages. Failure at any stage stops the pipeline.
-5. A background timeout monitor marks stale stages as `timed_out` (default: 5 minutes).
+2. **Auto-decompose preflight:** If the payload contains `decompose_if_complex: true` or a large array (>3 items), king asks the evaluation agent to decompose the task before starting. If decomposed, subtasks are created and the parent is marked `"decomposed"` instead of running as a monolith.
+3. Learning agent processes discovery, emits `pipeline:stage_result` with status `completed` and output.
+4. Coordinator advances to next stage: creates new DB record, emits `pipeline:next` to `role:building` room.
+5. Process repeats through all 5 stages.
+6. **Error recovery:** On stage failure, instead of halting immediately, king sets the task to `"recovering"` and emits `error:recovery_request` to the evaluation agent. The evaluation agent analyzes the failure and returns one of: `retry` (up to 3 retries), `decompose` (split into subtasks), `skip` (evaluation/skill_manage stages only), or `abort`. King executes the decision automatically. Recovery times out after 30 seconds, falling back to abort.
+7. A background timeout monitor marks stale stages as `timed_out` (default: 5 minutes). Uses `updated_at` so retried stages don't instantly time out.
 
 **Role rooms:** Each agent joins a `role:{role_name}` room on registration, enabling targeted `pipeline:next` dispatch.
 
@@ -518,6 +526,8 @@ All evo binaries support `--version` / `-V` to print their name and version.
 | `GET` | `/task/current` | Get the current active task |
 | `GET` | `/task/:task_id/logs` | Logs for a specific task |
 | `GET` | `/task/:task_id/subtasks` | Subtasks for a specific task |
+| `DELETE` | `/tasks/:task_id` | Delete a task (cascade: subtasks, logs, memories, pipeline runs). Aborts pipeline if running |
+| `POST` | `/tasks/:task_id/decompose` | Request evaluation agent to decompose a task into subtasks |
 
 ### Memory
 

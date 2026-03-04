@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use clap::{Parser, Subcommand};
 use evo_common::logging::init_logging_with_otel;
@@ -184,6 +184,8 @@ async fn main() -> Result<()> {
         .route("/task/current", get(task_current_handler))
         .route("/task/{task_id}/logs", get(task_logs_handler))
         .route("/task/{task_id}/subtasks", get(task_subtasks_handler))
+        .route("/tasks/{task_id}", delete(task_delete_handler))
+        .route("/tasks/{task_id}/decompose", post(task_decompose_handler))
         // ── Tracing endpoints ──────────────────────────────────────────────
         .route(
             "/v1/traces",
@@ -1345,6 +1347,74 @@ async fn task_subtasks_handler(
             }))
         }
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// DELETE /tasks/:task_id — delete a task and its subtasks.
+async fn task_delete_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    // If the task is running/recovering, abort the pipeline first
+    if let Ok(Some(task)) = task_db::get_task(&state.db, &task_id).await
+        && (task.status == "running" || task.status == "recovering")
+    {
+        state
+            .pipeline_coordinator
+            .abort_pipeline(
+                &task.run_id,
+                Some(&task),
+                &task.current_stage,
+                "Deleted by user",
+            )
+            .await;
+    }
+
+    match task_db::delete_task_cascade(&state.db, &task_id).await {
+        Ok((count, task_ids)) if count > 0 => {
+            tracing::info!(task_id = %task_id, deleted_count = count, "task deleted via HTTP");
+
+            let broadcast = serde_json::json!({
+                "action": "deleted",
+                "task_id": task_id,
+                "task_ids": task_ids,
+            });
+            let _ = state
+                .io
+                .to(evo_common::messages::events::ROOM_KERNEL)
+                .emit(evo_common::messages::events::TASK_CHANGED, &broadcast)
+                .await;
+            let _ = state
+                .io
+                .to("dashboard")
+                .emit(evo_common::messages::events::TASK_CHANGED, &broadcast)
+                .await;
+
+            Json(json!({ "success": true, "deleted_count": count }))
+        }
+        Ok(_) => Json(json!({ "success": false, "error": "task not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// POST /tasks/:task_id/decompose — request task decomposition.
+async fn task_decompose_handler(
+    State(state): State<Arc<KingState>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    match task_db::get_task(&state.db, &task_id).await {
+        Ok(Some(task)) => {
+            match state
+                .pipeline_coordinator
+                .request_decomposition(&task, "manual")
+                .await
+            {
+                Ok(()) => Json(json!({ "success": true })),
+                Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
+            }
+        }
+        Ok(None) => Json(json!({ "success": false, "error": "task not found" })),
+        Err(e) => Json(json!({ "success": false, "error": e.to_string() })),
     }
 }
 

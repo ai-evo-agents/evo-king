@@ -83,6 +83,10 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
         let s_task_join = Arc::clone(&state);
         let s_task_summary = Arc::clone(&state);
 
+        // Recovery/decompose handler arcs
+        let s_recovery_response = Arc::clone(&state);
+        let s_decompose_result = Arc::clone(&state);
+
         // System info handler arc
         let s_system_info = Arc::clone(&state);
 
@@ -324,6 +328,90 @@ pub fn register_handlers(io: SocketIo, state: Arc<KingState>) {
             move |s: SocketRef, Data::<serde_json::Value>(data), ack: AckSender| {
                 let state = Arc::clone(&s_task_summary);
                 async move { on_task_summary(s, data, ack, state).await }
+            },
+        );
+
+        // error:recovery_response — evaluation agent reports recovery recommendation
+        socket.on(
+            events::ERROR_RECOVERY_RESPONSE,
+            move |_s: SocketRef, Data::<serde_json::Value>(data)| {
+                let state = Arc::clone(&s_recovery_response);
+                async move {
+                    let request_id = data["request_id"].as_str().unwrap_or("");
+                    let run_id = data["run_id"].as_str().unwrap_or("");
+                    let task_id = data["task_id"].as_str().unwrap_or("");
+                    let action = data["action"].as_str().unwrap_or("abort");
+                    let params = data.get("params").cloned().unwrap_or(serde_json::json!({}));
+                    let reasoning = data["reasoning"].as_str().unwrap_or("");
+
+                    log_event(
+                        &state.db,
+                        events::ERROR_RECOVERY_RESPONSE,
+                        "inbound",
+                        data["agent_id"].as_str().unwrap_or(""),
+                        "",
+                        "",
+                        &data,
+                    );
+
+                    if let Err(e) = state
+                        .pipeline_coordinator
+                        .on_recovery_response(
+                            request_id,
+                            run_id,
+                            task_id,
+                            action,
+                            &params,
+                            reasoning,
+                        )
+                        .await
+                    {
+                        warn!(err = %e, "failed to process recovery response");
+                    }
+                }
+            },
+        );
+
+        // task:decompose_result — evaluation agent returns subtask decomposition
+        socket.on(
+            events::TASK_DECOMPOSE_RESULT,
+            move |_s: SocketRef, Data::<serde_json::Value>(data)| {
+                let state = Arc::clone(&s_decompose_result);
+                async move {
+                    let request_id = data["request_id"].as_str().unwrap_or("");
+                    let task_id = data["task_id"].as_str().unwrap_or("");
+                    let should_decompose = data["should_decompose"].as_bool().unwrap_or(false);
+                    let subtasks = data
+                        .get("subtasks")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let reasoning = data["reasoning"].as_str().unwrap_or("");
+
+                    log_event(
+                        &state.db,
+                        events::TASK_DECOMPOSE_RESULT,
+                        "inbound",
+                        data["agent_id"].as_str().unwrap_or(""),
+                        "",
+                        "",
+                        &data,
+                    );
+
+                    if let Err(e) = state
+                        .pipeline_coordinator
+                        .on_decompose_result(
+                            request_id,
+                            task_id,
+                            should_decompose,
+                            &subtasks,
+                            reasoning,
+                        )
+                        .await
+                    {
+                        warn!(err = %e, "failed to process decompose result");
+                    }
+                }
             },
         );
 
@@ -920,13 +1008,36 @@ async fn on_task_delete(
         }
     };
 
-    match task_db::delete_task(&state.db, task_id).await {
-        Ok(true) => {
-            info!(task_id = %task_id, "task deleted");
-            log_event(&state.db, events::TASK_DELETE, "inbound", "", "", "", &data);
-            let _ = ack.send(&serde_json::json!({ "success": true, "task_id": task_id }));
+    // Abort pipeline if task is running/recovering
+    if let Ok(Some(task)) = task_db::get_task(&state.db, task_id).await
+        && (task.status == "running" || task.status == "recovering")
+    {
+        state
+            .pipeline_coordinator
+            .abort_pipeline(
+                &task.run_id,
+                Some(&task),
+                &task.current_stage,
+                "Deleted by user",
+            )
+            .await;
+    }
 
-            let broadcast = serde_json::json!({ "action": "deleted", "task_id": task_id });
+    match task_db::delete_task_cascade(&state.db, task_id).await {
+        Ok((count, task_ids)) if count > 0 => {
+            info!(task_id = %task_id, deleted = count, "task cascade deleted");
+            log_event(&state.db, events::TASK_DELETE, "inbound", "", "", "", &data);
+            let _ = ack.send(&serde_json::json!({
+                "success": true,
+                "task_id": task_id,
+                "deleted_count": count
+            }));
+
+            let broadcast = serde_json::json!({
+                "action": "deleted",
+                "task_id": task_id,
+                "task_ids": task_ids
+            });
             if let Err(e) = socket
                 .to(events::ROOM_KERNEL)
                 .emit(events::TASK_CHANGED, &broadcast)
@@ -939,7 +1050,7 @@ async fn on_task_delete(
                 .emit(events::TASK_CHANGED, &broadcast)
                 .await;
         }
-        Ok(false) => {
+        Ok(_) => {
             ack_error(ack, &format!("task not found: {task_id}"));
         }
         Err(e) => {

@@ -343,6 +343,19 @@ pub async fn init_db(path: &str) -> Result<Database> {
         }
     }
 
+    // Phase 12: pipeline retry tracking
+    for sql in [
+        "ALTER TABLE pipeline_runs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE pipeline_runs ADD COLUMN input_metadata TEXT NOT NULL DEFAULT '{}'",
+    ] {
+        if let Err(e) = conn.execute(sql, ()).await {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                warn!(sql = sql, err = %msg, "migration failed");
+            }
+        }
+    }
+
     info!(path = %path, "database initialized");
     Ok(db)
 }
@@ -848,6 +861,7 @@ pub async fn update_task(
 }
 
 /// Delete a task by ID. Returns true if a row was deleted.
+#[allow(dead_code)]
 pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
     let conn = db_connect(db).await?;
 
@@ -857,6 +871,112 @@ pub async fn delete_task(db: &Database, task_id: &str) -> Result<bool> {
         .context("delete task")?;
 
     Ok(rows_affected > 0)
+}
+
+/// Delete a task and all its subtasks, logs, and memory bindings.
+/// Returns (deleted_count, list_of_deleted_task_ids).
+pub async fn delete_task_cascade(db: &Database, task_id: &str) -> Result<(u32, Vec<String>)> {
+    let conn = db_connect(db).await?;
+
+    // Get the task's run_id before deleting (for pipeline_runs cleanup)
+    let mut run_id_rows = conn
+        .query(
+            "SELECT run_id FROM tasks WHERE id = ?1",
+            libsql::params![task_id],
+        )
+        .await
+        .context("get task run_id")?;
+    let run_id = run_id_rows
+        .next()
+        .await
+        .context("read run_id")?
+        .and_then(|row| row.get::<String>(0).ok())
+        .unwrap_or_default();
+
+    // Collect all task IDs to delete (parent + direct subtasks)
+    let mut task_ids = vec![task_id.to_string()];
+    let mut sub_rows = conn
+        .query(
+            "SELECT id FROM tasks WHERE parent_id = ?1",
+            libsql::params![task_id],
+        )
+        .await
+        .context("find subtasks")?;
+    while let Some(row) = sub_rows.next().await.context("read subtask id")? {
+        task_ids.push(row.get::<String>(0).context("read id")?);
+    }
+
+    let mut total_deleted: u32 = 0;
+
+    for tid in &task_ids {
+        let _ = conn
+            .execute(
+                "DELETE FROM task_memories WHERE task_id = ?1",
+                libsql::params![tid.as_str()],
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "DELETE FROM task_logs WHERE task_id = ?1",
+                libsql::params![tid.as_str()],
+            )
+            .await;
+        let deleted = conn
+            .execute(
+                "DELETE FROM tasks WHERE id = ?1",
+                libsql::params![tid.as_str()],
+            )
+            .await
+            .unwrap_or(0);
+        total_deleted += deleted as u32;
+    }
+
+    // Clean up pipeline_runs for this task's run_id (if non-empty)
+    if !run_id.is_empty() {
+        let _ = conn
+            .execute(
+                "DELETE FROM pipeline_runs WHERE run_id = ?1",
+                libsql::params![run_id.as_str()],
+            )
+            .await;
+    }
+
+    Ok((total_deleted, task_ids))
+}
+
+/// Increment the retry count for a pipeline stage and reset to running.
+pub async fn retry_pipeline_stage(db: &Database, stage_id: &str) -> Result<()> {
+    let conn = db_connect(db).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    conn.execute(
+        "UPDATE pipeline_runs SET retry_count = retry_count + 1, status = 'running', updated_at = ?1
+         WHERE id = ?2",
+        libsql::params![now.as_str(), stage_id],
+    )
+    .await
+    .context("retry pipeline stage")?;
+
+    Ok(())
+}
+
+/// Get the retry count for the most recent stage record of a run/stage combo.
+pub async fn get_stage_retry_count(db: &Database, run_id: &str, stage: &str) -> Result<u32> {
+    let conn = db_connect(db).await?;
+
+    let mut rows = conn
+        .query(
+            "SELECT retry_count FROM pipeline_runs WHERE run_id = ?1 AND stage = ?2
+             ORDER BY created_at DESC LIMIT 1",
+            libsql::params![run_id, stage],
+        )
+        .await
+        .context("query stage retry count")?;
+
+    match rows.next().await.context("read retry row")? {
+        Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) as u32),
+        None => Ok(0),
+    }
 }
 
 /// Get the current (most recent) task. Prefers running tasks over others.
@@ -1118,6 +1238,9 @@ pub struct PipelineRow {
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[allow(dead_code)]
+    pub retry_count: u32,
+    pub input_metadata: String,
 }
 
 fn row_to_pipeline(row: &libsql::Row) -> Result<PipelineRow> {
@@ -1132,6 +1255,8 @@ fn row_to_pipeline(row: &libsql::Row) -> Result<PipelineRow> {
         error: row.get::<String>(7).ok(),
         created_at: row.get::<String>(8).context("read created_at")?,
         updated_at: row.get::<String>(9).context("read updated_at")?,
+        retry_count: row.get::<i64>(10).unwrap_or(0) as u32,
+        input_metadata: row.get::<String>(11).unwrap_or_default(),
     })
 }
 
@@ -1141,15 +1266,16 @@ pub async fn create_pipeline_stage(
     run_id: &str,
     stage: &str,
     artifact_id: &str,
+    input_metadata: &str,
 ) -> Result<PipelineRow> {
     let conn = db_connect(db).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
 
     conn.execute(
-        "INSERT INTO pipeline_runs (id, run_id, stage, artifact_id, status, agent_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'running', '', ?5, ?6)",
-        libsql::params![id.as_str(), run_id, stage, artifact_id, now.as_str(), now.as_str()],
+        "INSERT INTO pipeline_runs (id, run_id, stage, artifact_id, status, agent_id, input_metadata, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'running', '', ?5, ?6, ?7)",
+        libsql::params![id.as_str(), run_id, stage, artifact_id, input_metadata, now.as_str(), now.as_str()],
     )
     .await
     .context("create pipeline stage")?;
@@ -1165,6 +1291,8 @@ pub async fn create_pipeline_stage(
         error: None,
         created_at: now.clone(),
         updated_at: now,
+        retry_count: 0,
+        input_metadata: input_metadata.to_string(),
     })
 }
 
@@ -1199,7 +1327,7 @@ pub async fn get_pipeline_run_stages(db: &Database, run_id: &str) -> Result<Vec<
 
     let mut rows = conn
         .query(
-            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at, retry_count, input_metadata
              FROM pipeline_runs WHERE run_id = ?1 ORDER BY created_at ASC",
             libsql::params![run_id],
         )
@@ -1221,7 +1349,7 @@ pub async fn get_active_pipeline_runs(db: &Database) -> Result<Vec<PipelineRow>>
 
     let mut rows = conn
         .query(
-            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at, retry_count, input_metadata
              FROM pipeline_runs WHERE status = 'running' ORDER BY created_at DESC",
             (),
         )
@@ -1243,8 +1371,8 @@ pub async fn get_timed_out_stages(db: &Database, timeout_seconds: i64) -> Result
 
     let mut rows = conn
         .query(
-            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
-             FROM pipeline_runs WHERE status = 'running' AND created_at < ?1",
+            "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at, retry_count, input_metadata
+             FROM pipeline_runs WHERE status = 'running' AND updated_at < ?1",
             libsql::params![cutoff.as_str()],
         )
         .await
@@ -1413,7 +1541,7 @@ pub async fn list_pipeline_runs(
     let conn = db_connect(db).await?;
 
     let mut sql = String::from(
-        "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at
+        "SELECT id, run_id, stage, artifact_id, status, agent_id, result, error, created_at, updated_at, retry_count, input_metadata
          FROM pipeline_runs WHERE 1=1",
     );
     let mut param_values: Vec<libsql::Value> = Vec::new();
